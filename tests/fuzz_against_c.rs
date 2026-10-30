@@ -201,12 +201,15 @@ fn matches_c_library_on_randomised_cases() {
         print_ez(&mut rebuilt, "exts2_sse", &ez);
     }
 
-    if rebuilt != EXPECTED {
-        for (i, (a, b)) in EXPECTED.lines().zip(rebuilt.lines()).enumerate() {
+    // 期望文件以 LF 入库（见 .gitattributes）；这里再归一化一次，
+    // 让 core.autocrlf=true 的检出（如未重新配置的 Windows 工作区）也能通过。
+    let expected = EXPECTED.replace("\r\n", "\n");
+    if rebuilt != expected {
+        for (i, (a, b)) in expected.lines().zip(rebuilt.lines()).enumerate() {
             if a != b {
                 panic!("mismatch on line {}:\n  C: {a}\n  R: {b}", i + 1);
             }
         }
-        panic!("length differs: C {} vs Rust {}", EXPECTED.len(), rebuilt.len());
+        panic!("length differs: C {} vs Rust {}", expected.len(), rebuilt.len());
     }
 }

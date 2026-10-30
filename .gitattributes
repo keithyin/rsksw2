@@ -1,0 +1,10 @@
+# 统一的换行规范：文本文件在仓库与工作区中都是 LF。
+# 否则 Windows 上（GitHub Actions 的 windows runner 默认 core.autocrlf=true）
+# 检出的期望文件带 CRLF，与程序输出的 LF 逐字节比较必然失败。
+* text=auto eol=lf
+
+# 期望输出必须与 C 版二进制生成的字节完全一致：强制 LF，禁止平台相关的换行转换
+tests/expected/** text eol=lf
+
+*.gz binary
+*.sh text eol=lf
