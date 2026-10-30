@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  # 供 release.yml 通过 `uses: ./.github/workflows/ci.yml` 复用，
+  # 保证打 tag 时跑的是同一套 CI。
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # ksw2-test 无条件调用 ksw_*_sse，这些入口只在 x86_64 上编译
+        # （与 C 源码的 `#ifdef __SSE2__` 一致），因此矩阵只含 x86_64 平台。
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --locked --verbose
+
+      - name: Run tests
+        # golden 用例与随机模糊用例都已在 tests/expected/ 入库，
+        # 无需在这里编译 ksw2/ 下的 C 参考实现。
+        run: cargo test --locked --verbose
+
+      - name: Build library only (no CLI, no dependencies)
+        run: cargo build --locked --release --no-default-features
+
+  lint:
+    name: Lint (fmt & clippy)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # 移植代码刻意保持与 C 源文件逐行对应的排版，rustfmt 的差异不作为失败条件
+      - name: Check formatting
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      # 移植代码刻意保持与 C 参考实现一致的写法，clippy 警告不作为失败条件
+      - name: Clippy
+        continue-on-error: true
+        run: cargo clippy --locked --all-targets
+
+      # 提前验证 crates.io 打包（元数据/文件列表/大小），避免打 tag 后才发现
+      - name: Check crates.io packaging
+        run: cargo package --locked
