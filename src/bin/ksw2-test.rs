@@ -10,224 +10,358 @@ use flate2::read::MultiGzDecoder;
 use rsksw2::*;
 
 /// Same encoding table as `cli.c` (0/1/2/3 for A/C/G/T, 4 for anything else).
-const SEQ_NT4_TABLE: [u8; 256] = {
-    let mut t = [4u8; 256];
-    t[b'A' as usize] = 0;
-    t[b'C' as usize] = 1;
-    t[b'G' as usize] = 2;
-    t[b'T' as usize] = 3;
-    t[b'a' as usize] = 0;
-    t[b'c' as usize] = 1;
-    t[b'g' as usize] = 2;
-    t[b't' as usize] = 3;
-    t
+const NUCLEOTIDE_ENCODING_TABLE: [u8; 256] = {
+    let mut table = [4u8; 256];
+    table[b'A' as usize] = 0;
+    table[b'C' as usize] = 1;
+    table[b'G' as usize] = 2;
+    table[b'T' as usize] = 3;
+    table[b'a' as usize] = 0;
+    table[b'c' as usize] = 1;
+    table[b'g' as usize] = 2;
+    table[b't' as usize] = 3;
+    table
 };
 
 struct Record {
     name: String,
-    seq: String,
+    sequence: String,
 }
 
 /// Minimal re-implementation of `kseq.h` for FASTA/FASTQ input.
 fn read_records(path: &str) -> std::io::Result<Vec<Record>> {
-    let raw = fs::read(path)?;
-    let data = if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
-        let mut out = Vec::new();
-        std::io::Read::read_to_end(&mut MultiGzDecoder::new(&raw[..]), &mut out)?;
-        out
+    let raw_bytes = fs::read(path)?;
+    let contents = if raw_bytes.len() >= 2 && raw_bytes[0] == 0x1f && raw_bytes[1] == 0x8b {
+        let mut decompressed = Vec::new();
+        std::io::Read::read_to_end(&mut MultiGzDecoder::new(&raw_bytes[..]), &mut decompressed)?;
+        decompressed
     } else {
-        raw
+        raw_bytes
     };
-    let mut recs = Vec::new();
-    let mut i = 0usize;
-    let n = data.len();
-    while i < n {
+    let mut records = Vec::new();
+    let mut position = 0usize;
+    let data_len = contents.len();
+    while position < data_len {
         // skip empty lines between records
-        while i < n && (data[i] == b'\n' || data[i] == b'\r') {
-            i += 1;
+        while position < data_len && (contents[position] == b'\n' || contents[position] == b'\r') {
+            position += 1;
         }
-        if i >= n {
+        if position >= data_len {
             break;
         }
-        let fastq = data[i] == b'@';
-        if data[i] != b'>' && data[i] != b'@' {
+        let is_fastq = contents[position] == b'@';
+        if contents[position] != b'>' && contents[position] != b'@' {
             // garbage; skip the line
-            while i < n && data[i] != b'\n' {
-                i += 1;
+            while position < data_len && contents[position] != b'\n' {
+                position += 1;
             }
             continue;
         }
-        i += 1; // skip '>' / '@'
-        let name_start = i;
-        while i < n && data[i] != b'\n' && data[i] != b'\r' && !data[i].is_ascii_whitespace() {
-            i += 1;
+        position += 1; // skip '>' / '@'
+        let name_start = position;
+        while position < data_len
+            && contents[position] != b'\n'
+            && contents[position] != b'\r'
+            && !contents[position].is_ascii_whitespace()
+        {
+            position += 1;
         }
-        let name = String::from_utf8_lossy(&data[name_start..i]).into_owned();
-        while i < n && data[i] != b'\n' {
-            i += 1;
+        let name = String::from_utf8_lossy(&contents[name_start..position]).into_owned();
+        while position < data_len && contents[position] != b'\n' {
+            position += 1;
         }
-        if i < n {
-            i += 1;
+        if position < data_len {
+            position += 1;
         }
-        let mut seq = Vec::new();
-        let mut seq_len = 0usize;
+        let mut sequence_buffer = Vec::new();
+        let mut sequence_length = 0usize;
         loop {
-            if i >= n {
+            if position >= data_len {
                 break;
             }
-            let c = data[i];
-            if c == b'>' || (c == b'@' && fastq && seq_len > 0) {
+            let byte = contents[position];
+            if byte == b'>' || (byte == b'@' && is_fastq && sequence_length > 0) {
                 break;
             }
-            if c == b'+' && fastq && seq_len > 0 {
-                // FASTQ quality block: skip the '+' line and seq_len bytes
-                while i < n && data[i] != b'\n' {
-                    i += 1;
+            if byte == b'+' && is_fastq && sequence_length > 0 {
+                // FASTQ quality block: skip the '+' line and sequence_length bytes
+                while position < data_len && contents[position] != b'\n' {
+                    position += 1;
                 }
-                if i < n {
-                    i += 1;
+                if position < data_len {
+                    position += 1;
                 }
-                let mut q = 0usize;
-                while i < n && q < seq_len {
-                    if data[i] != b'\n' && data[i] != b'\r' {
-                        q += 1;
+                let mut quality_bytes = 0usize;
+                while position < data_len && quality_bytes < sequence_length {
+                    if contents[position] != b'\n' && contents[position] != b'\r' {
+                        quality_bytes += 1;
                     }
-                    i += 1;
+                    position += 1;
                 }
                 break;
             }
-            if c == b'\n' || c == b'\r' {
-                i += 1;
+            if byte == b'\n' || byte == b'\r' {
+                position += 1;
                 continue;
             }
-            seq.push(c);
-            seq_len += 1;
-            i += 1;
+            sequence_buffer.push(byte);
+            sequence_length += 1;
+            position += 1;
         }
-        recs.push(Record {
+        records.push(Record {
             name,
-            seq: String::from_utf8_lossy(&seq).into_owned(),
+            sequence: String::from_utf8_lossy(&sequence_buffer).into_owned(),
         });
     }
-    Ok(recs)
+    Ok(records)
 }
 
-fn encode(seq: &str) -> Vec<u8> {
-    seq.bytes().map(|c| SEQ_NT4_TABLE[c as usize]).collect()
+fn encode_sequence(sequence: &str) -> Vec<u8> {
+    sequence
+        .bytes()
+        .map(|byte| NUCLEOTIDE_ENCODING_TABLE[byte as usize])
+        .collect()
 }
 
-struct Opts {
-    q: i8,
-    e: i8,
-    q2: i8,
-    e2: i8,
-    w: i32,
-    zdrop: i32,
-    flag: i32,
-    m: i8,
-    mat: [i8; 25],
+struct Options {
+    gap_open: i8,
+    gap_extension: i8,
+    gap_open2: i8,
+    gap_extension2: i8,
+    band_width: i32,
+    z_drop: i32,
+    flags: i32,
+    alphabet_size: i8,
+    score_matrix: [i8; 25],
 }
 
-fn global_aln(algo: &str, ez: &mut KswExtz, qseq_: &str, tseq_: &str, o: &Opts) {
+fn run_alignment(
+    algorithm: &str,
+    result: &mut KswExtz,
+    query_sequence: &str,
+    target_sequence: &str,
+    options: &Options,
+) {
     // equivalent of the field resets at the top of global_aln() in cli.c
-    ez.max_q = -1;
-    ez.max_t = -1;
-    ez.mqe_t = -1;
-    ez.mte_q = -1;
-    ez.max = 0;
-    ez.mqe = KSW_NEG_INF;
-    ez.mte = KSW_NEG_INF;
-    ez.cigar.clear();
+    result.max_q = -1;
+    result.max_t = -1;
+    result.mqe_t = -1;
+    result.mte_q = -1;
+    result.max = 0;
+    result.mqe = KSW_NEG_INF;
+    result.mte = KSW_NEG_INF;
+    result.cigar.clear();
 
-    let qseq = encode(qseq_);
-    let tseq = encode(tseq_);
-    let qlen = qseq.len() as i32;
-    let tlen = tseq.len() as i32;
-    let (m, mat, q, e, q2, e2, w, zdrop, flag) =
-        (o.m, &o.mat[..], o.q, o.e, o.q2, o.e2, o.w, o.zdrop, o.flag);
-    let score_only = flag & KSW_EZ_SCORE_ONLY != 0;
+    let encoded_query = encode_sequence(query_sequence);
+    let encoded_target = encode_sequence(target_sequence);
+    let query_len = encoded_query.len() as i32;
+    let target_len = encoded_target.len() as i32;
+    let alphabet_size = options.alphabet_size;
+    let score_matrix = &options.score_matrix[..];
+    let gap_open = options.gap_open;
+    let gap_extension = options.gap_extension;
+    let gap_open2 = options.gap_open2;
+    let gap_extension2 = options.gap_extension2;
+    let band_width = options.band_width;
+    let z_drop = options.z_drop;
+    let flags = options.flags;
+    let score_only = flags & KSW_EZ_SCORE_ONLY != 0;
 
-    match algo {
+    match algorithm {
         "gg" => {
-            let ci = if score_only { None } else { Some(&mut ez.cigar) };
-            ez.score = ksw_gg(qlen, &qseq, tlen, &tseq, m, mat, q, e, w, ci);
+            let cigar = if score_only { None } else { Some(&mut result.cigar) };
+            result.score = ksw_gg(
+                query_len,
+                &encoded_query,
+                target_len,
+                &encoded_target,
+                alphabet_size,
+                score_matrix,
+                gap_open,
+                gap_extension,
+                band_width,
+                cigar,
+            );
         }
         "gg2" => {
-            let ci = if score_only { None } else { Some(&mut ez.cigar) };
-            ez.score = ksw_gg2(qlen, &qseq, tlen, &tseq, m, mat, q, e, w, ci);
+            let cigar = if score_only { None } else { Some(&mut result.cigar) };
+            result.score = ksw_gg2(
+                query_len,
+                &encoded_query,
+                target_len,
+                &encoded_target,
+                alphabet_size,
+                score_matrix,
+                gap_open,
+                gap_extension,
+                band_width,
+                cigar,
+            );
         }
         "gg2_sse" => {
-            ez.score = ksw_gg2_sse(qlen, &qseq, tlen, &tseq, m, mat, q, e, w, &mut ez.cigar);
+            result.score = ksw_gg2_sse(
+                query_len,
+                &encoded_query,
+                target_len,
+                &encoded_target,
+                alphabet_size,
+                score_matrix,
+                gap_open,
+                gap_extension,
+                band_width,
+                &mut result.cigar,
+            );
         }
         "extz" => {
-            ksw_extz(qlen, &qseq, tlen, &tseq, m, mat, q, e, w, zdrop, flag, ez);
+            ksw_extz(
+                query_len,
+                &encoded_query,
+                target_len,
+                &encoded_target,
+                alphabet_size,
+                score_matrix,
+                gap_open,
+                gap_extension,
+                band_width,
+                z_drop,
+                flags,
+                result,
+            );
         }
         "extz2_sse" => {
-            ksw_extz2_sse(qlen, &qseq, tlen, &tseq, m, mat, q, e, w, zdrop, 0, flag, ez);
+            ksw_extz2_sse(
+                query_len,
+                &encoded_query,
+                target_len,
+                &encoded_target,
+                alphabet_size,
+                score_matrix,
+                gap_open,
+                gap_extension,
+                band_width,
+                z_drop,
+                0,
+                flags,
+                result,
+            );
         }
         "extd" => {
-            ksw_extd(qlen, &qseq, tlen, &tseq, m, mat, q, e, q2, e2, w, zdrop, flag, ez);
+            ksw_extd(
+                query_len,
+                &encoded_query,
+                target_len,
+                &encoded_target,
+                alphabet_size,
+                score_matrix,
+                gap_open,
+                gap_extension,
+                gap_open2,
+                gap_extension2,
+                band_width,
+                z_drop,
+                flags,
+                result,
+            );
         }
         "extd2_sse" => {
             ksw_extd2_sse(
-                qlen, &qseq, tlen, &tseq, m, mat, q, e, q2, e2, w, zdrop, 0, flag, ez,
+                query_len,
+                &encoded_query,
+                target_len,
+                &encoded_target,
+                alphabet_size,
+                score_matrix,
+                gap_open,
+                gap_extension,
+                gap_open2,
+                gap_extension2,
+                band_width,
+                z_drop,
+                0,
+                flags,
+                result,
             );
         }
         "extf2_sse" => {
-            ksw_extf2_sse(qlen, &qseq, tlen, &tseq, mat[0], mat[1], e, w, zdrop, ez);
+            ksw_extf2_sse(
+                query_len,
+                &encoded_query,
+                target_len,
+                &encoded_target,
+                score_matrix[0],
+                score_matrix[1],
+                gap_extension,
+                band_width,
+                z_drop,
+                result,
+            );
         }
         "exts2_sse" => {
-            let mut mat2 = [0i8; 25];
-            gen_simple_mat(5, &mut mat2, 1, 2);
+            let mut splice_score_matrix = [0i8; 25];
+            gen_simple_mat(5, &mut splice_score_matrix, 1, 2);
             ksw_exts2_sse(
-                qlen,
-                &qseq,
-                tlen,
-                &tseq,
-                m,
-                &mat2,
+                query_len,
+                &encoded_query,
+                target_len,
+                &encoded_target,
+                alphabet_size,
+                &splice_score_matrix,
                 2,
                 1,
                 32,
                 4,
-                zdrop,
+                z_drop,
                 0,
-                flag | KSW_EZ_SPLICE_FOR,
+                flags | KSW_EZ_SPLICE_FOR,
                 &[],
-                ez,
+                result,
             );
         }
         "test" => {
             ksw_extd2_sse(
-                qlen, &qseq, tlen, &tseq, m, mat, 4, 2, 24, 1, 751, 400, 0, 8, ez,
+                query_len,
+                &encoded_query,
+                target_len,
+                &encoded_target,
+                alphabet_size,
+                score_matrix,
+                4,
+                2,
+                24,
+                1,
+                751,
+                400,
+                0,
+                8,
+                result,
             );
         }
         _ => {
-            eprintln!("ERROR: can't find algorithm '{algo}'");
+            eprintln!("ERROR: can't find algorithm '{algorithm}'");
             std::process::exit(1);
         }
     }
 }
 
-fn print_aln(out: &mut impl Write, tname: &str, qname: &str, ez: &KswExtz) {
+fn print_alignment(writer: &mut impl Write, target_name: &str, query_name: &str, result: &KswExtz) {
     let _ = write!(
-        out,
+        writer,
         "{}\t{}\t{}\t{}\t{}\t{}",
-        tname,
-        qname,
-        ez.score,
-        ez.max as i32,
-        ez.max_t,
-        ez.max_q
+        target_name,
+        query_name,
+        result.score,
+        result.max as i32,
+        result.max_t,
+        result.max_q
     );
-    if !ez.cigar.is_empty() {
-        let _ = out.write_all(b"\t");
-        for &c in &ez.cigar {
-            let op = (c & 0xf) as usize;
+    if !result.cigar.is_empty() {
+        let _ = writer.write_all(b"\t");
+        for &encoded in &result.cigar {
+            let operation = (encoded & 0xf) as usize;
             // cli.c prints "MID"[op], i.e. a NUL byte for op 3 (N) and an
             // out-of-bounds read for op >= 4; we reproduce the former and use
             // '='/'X' for the EQX operators.
-            let ch = match op {
+            let operator_byte = match operation {
                 0 => b'M',
                 1 => b'I',
                 2 => b'D',
@@ -236,142 +370,179 @@ fn print_aln(out: &mut impl Write, tname: &str, qname: &str, ez: &KswExtz) {
                 8 => b'X',
                 _ => b'?',
             };
-            let _ = write!(out, "{}", c >> 4);
-            let _ = out.write_all(&[ch]);
+            let _ = write!(writer, "{}", encoded >> 4);
+            let _ = writer.write_all(&[operator_byte]);
         }
     }
-    let _ = out.write_all(b"\n");
+    let _ = writer.write_all(b"\n");
 }
 
-fn usage(algo: &str, zdrop: i32, a: i8, b: i8, q: i8, e: i8, q2: i8, e2: i8) {
+fn usage(
+    algorithm: &str,
+    z_drop: i32,
+    match_score: i8,
+    mismatch_penalty: i8,
+    gap_open: i8,
+    gap_extension: i8,
+    gap_open2: i8,
+    gap_extension2: i8,
+) {
     eprintln!("Usage: ksw2-test [options] <DNA-target> <DNA-query>");
     eprintln!("Options:");
     eprintln!(
         "  -t STR        algorithm: gg, gg2, gg2_sse, extz, extz2_sse, extd, extd2_sse [{}]",
-        algo
+        algorithm
     );
     eprintln!("  -R INT        repeat INT times (for benchmarking) [1]");
     eprintln!("  -w INT        band width [inf]");
-    eprintln!("  -z INT        Z-drop [{}]", zdrop);
+    eprintln!("  -z INT        Z-drop [{}]", z_drop);
     eprintln!("  -r            gap right alignment");
     eprintln!("  -s            score only");
-    eprintln!("  -A INT        match score [{}]", a);
-    eprintln!("  -B INT        mismatch penalty [{}]", b);
-    eprintln!("  -O INT[,INT]  gap open penalty [{},{}]", q, q2);
-    eprintln!("  -E INT[,INT]  gap extension penalty [{},{}]", e, e2);
+    eprintln!("  -A INT        match score [{}]", match_score);
+    eprintln!("  -B INT        mismatch penalty [{}]", mismatch_penalty);
+    eprintln!("  -O INT[,INT]  gap open penalty [{},{}]", gap_open, gap_open2);
+    eprintln!(
+        "  -E INT[,INT]  gap extension penalty [{},{}]",
+        gap_extension, gap_extension2
+    );
     eprintln!("  -a            all vs all");
 }
 
-fn parse_pair(s: &str) -> (i32, Option<i32>) {
-    let mut it = s.split(',');
-    let first = it.next().unwrap_or("0").trim().parse::<i32>().unwrap_or(0);
-    let second = it.next().map(|x| x.trim().parse::<i32>().unwrap_or(0));
+fn parse_penalty_pair(spec: &str) -> (i32, Option<i32>) {
+    let mut parts = spec.split(',');
+    let first = parts.next().unwrap_or("0").trim().parse::<i32>().unwrap_or(0);
+    let second = parts.next().map(|part| part.trim().parse::<i32>().unwrap_or(0));
     (first, second)
 }
 
 fn main() {
-    let argv: Vec<String> = std::env::args().collect();
-    let mut a: i8 = 2;
-    let mut b: i8 = 4;
-    let mut q: i8 = 4;
-    let mut e: i8 = 2;
-    let mut q2: i8 = 13;
-    let mut e2: i8 = 1;
-    let mut pair = true;
-    let mut w = -1i32;
-    let mut flag = 0i32;
-    let mut rep = 1i32;
-    let mut zdrop = -1i32;
-    let mut algo = String::from("extd");
+    let arguments: Vec<String> = std::env::args().collect();
+    let mut match_score: i8 = 2;
+    let mut mismatch_penalty: i8 = 4;
+    let mut gap_open: i8 = 4;
+    let mut gap_extension: i8 = 2;
+    let mut gap_open2: i8 = 13;
+    let mut gap_extension2: i8 = 1;
+    let mut pairwise_mode = true;
+    let mut band_width = -1i32;
+    let mut flags = 0i32;
+    let mut repeat_count = 1i32;
+    let mut z_drop = -1i32;
+    let mut algorithm = String::from("extd");
 
-    let mut i = 1usize;
+    let mut position = 1usize;
     let mut operands: Vec<String> = Vec::new();
-    while i < argv.len() {
-        let arg = &argv[i];
-        if arg.len() >= 2 && arg.starts_with('-') && arg != "-" {
+    while position < arguments.len() {
+        let argument = &arguments[position];
+        if argument.len() >= 2 && argument.starts_with('-') && argument != "-" {
             // supports "-t extd" as well as "-textd"
-            let opt = arg.as_bytes()[1] as char;
-            let mut inline_val = if arg.len() > 2 { Some(arg[2..].to_string()) } else { None };
-            let mut next_val = |i: &mut usize| -> String {
-                if let Some(v) = inline_val.take() {
-                    return v;
-                }
-                *i += 1;
-                argv.get(*i).cloned().unwrap_or_default()
+            let option = argument.as_bytes()[1] as char;
+            let mut inline_value = if argument.len() > 2 {
+                Some(argument[2..].to_string())
+            } else {
+                None
             };
-            match opt {
-                't' => algo = next_val(&mut i),
-                'w' => w = next_val(&mut i).trim().parse().unwrap_or(0),
-                'R' => rep = next_val(&mut i).trim().parse().unwrap_or(1),
-                'z' => zdrop = next_val(&mut i).trim().parse().unwrap_or(0),
-                'A' => a = next_val(&mut i).trim().parse().unwrap_or(0),
-                'B' => b = next_val(&mut i).trim().parse().unwrap_or(0),
+            let mut next_value = |position: &mut usize| -> String {
+                if let Some(value) = inline_value.take() {
+                    return value;
+                }
+                *position += 1;
+                arguments.get(*position).cloned().unwrap_or_default()
+            };
+            match option {
+                't' => algorithm = next_value(&mut position),
+                'w' => band_width = next_value(&mut position).trim().parse().unwrap_or(0),
+                'R' => repeat_count = next_value(&mut position).trim().parse().unwrap_or(1),
+                'z' => z_drop = next_value(&mut position).trim().parse().unwrap_or(0),
+                'A' => match_score = next_value(&mut position).trim().parse().unwrap_or(0),
+                'B' => mismatch_penalty = next_value(&mut position).trim().parse().unwrap_or(0),
                 'O' => {
-                    let (x, y) = parse_pair(&next_val(&mut i));
-                    q = x as i8;
-                    q2 = y.unwrap_or(x) as i8;
+                    let (first, second) = parse_penalty_pair(&next_value(&mut position));
+                    gap_open = first as i8;
+                    gap_open2 = second.unwrap_or(first) as i8;
                 }
                 'E' => {
-                    let (x, y) = parse_pair(&next_val(&mut i));
-                    e = x as i8;
-                    e2 = y.unwrap_or(x) as i8;
+                    let (first, second) = parse_penalty_pair(&next_value(&mut position));
+                    gap_extension = first as i8;
+                    gap_extension2 = second.unwrap_or(first) as i8;
                 }
-                'r' => flag |= KSW_EZ_RIGHT,
-                's' => flag |= KSW_EZ_SCORE_ONLY,
-                'g' => flag |= KSW_EZ_APPROX_MAX | KSW_EZ_APPROX_DROP,
+                'r' => flags |= KSW_EZ_RIGHT,
+                's' => flags |= KSW_EZ_SCORE_ONLY,
+                'g' => flags |= KSW_EZ_APPROX_MAX | KSW_EZ_APPROX_DROP,
                 'K' => {} // no_kalloc: the Rust port has no memory pool
-                'a' => pair = false,
+                'a' => pairwise_mode = false,
                 _ => {}
             }
         } else {
-            operands.push(arg.clone());
+            operands.push(argument.clone());
         }
-        i += 1;
+        position += 1;
     }
 
     if operands.len() < 2 {
-        usage(&algo, zdrop, a, b, q, e, q2, e2);
+        usage(
+            &algorithm,
+            z_drop,
+            match_score,
+            mismatch_penalty,
+            gap_open,
+            gap_extension,
+            gap_open2,
+            gap_extension2,
+        );
         std::process::exit(1);
     }
 
-    let mut mat = [0i8; 25];
-    gen_simple_mat(5, &mut mat, a, -b);
-    let opts = Opts {
-        q,
-        e,
-        q2,
-        e2,
-        w,
-        zdrop,
-        flag,
-        m: 5,
-        mat,
+    let mut score_matrix = [0i8; 25];
+    gen_simple_mat(5, &mut score_matrix, match_score, -mismatch_penalty);
+    let options = Options {
+        gap_open,
+        gap_extension,
+        gap_open2,
+        gap_extension2,
+        band_width,
+        z_drop,
+        flags,
+        alphabet_size: 5,
+        score_matrix,
     };
 
     let stdout = std::io::stdout();
-    let mut out = std::io::BufWriter::new(stdout.lock());
-    let mut ez = KswExtz::new();
+    let mut writer = std::io::BufWriter::new(stdout.lock());
+    let mut result = KswExtz::new();
 
-    let f0 = read_records(&operands[0]);
-    let f1 = read_records(&operands[1]);
-    match (f0, f1) {
+    let target_file = read_records(&operands[0]);
+    let query_file = read_records(&operands[1]);
+    match (target_file, query_file) {
         (Err(_), Err(_)) => {
-            global_aln(&algo, &mut ez, &operands[1], &operands[0], &opts);
-            print_aln(&mut out, "first", "second", &ez);
+            run_alignment(&algorithm, &mut result, &operands[1], &operands[0], &options);
+            print_alignment(&mut writer, "first", "second", &result);
         }
-        (Ok(trecs), Ok(qrecs)) => {
-            if pair {
-                for (t, qr) in trecs.iter().zip(qrecs.iter()) {
-                    for _ in 0..rep {
-                        global_aln(&algo, &mut ez, &qr.seq, &t.seq, &opts);
+        (Ok(target_records), Ok(query_records)) => {
+            if pairwise_mode {
+                for (target_record, query_record) in target_records.iter().zip(query_records.iter()) {
+                    for _ in 0..repeat_count {
+                        run_alignment(
+                            &algorithm,
+                            &mut result,
+                            &query_record.sequence,
+                            &target_record.sequence,
+                            &options,
+                        );
                     }
-                    print_aln(&mut out, &t.name, &qr.name, &ez);
+                    print_alignment(&mut writer, &target_record.name, &query_record.name, &result);
                 }
             } else {
-                for qr in qrecs.iter() {
-                    for t in trecs.iter() {
-                        global_aln(&algo, &mut ez, &qr.seq, &t.seq, &opts);
-                        print_aln(&mut out, &t.name, &qr.name, &ez);
+                for query_record in query_records.iter() {
+                    for target_record in target_records.iter() {
+                        run_alignment(
+                            &algorithm,
+                            &mut result,
+                            &query_record.sequence,
+                            &target_record.sequence,
+                            &options,
+                        );
+                        print_alignment(&mut writer, &target_record.name, &query_record.name, &result);
                     }
                 }
             }
@@ -380,5 +551,5 @@ fn main() {
             // same as cli.c: when only one of the two files can be opened, do nothing
         }
     }
-    let _ = out.flush();
+    let _ = writer.flush();
 }

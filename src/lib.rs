@@ -31,17 +31,17 @@
 //! use rsksw2::*;
 //!
 //! // simple 5x5 scoring matrix: match +2, mismatch -4, wildcard row/col 0
-//! let mat: [i8; 25] = [2, -4, -4, -4, 0,
-//!                     -4, 2, -4, -4, 0,
-//!                     -4, -4, 2, -4, 0,
-//!                     -4, -4, -4, 2, 0,
-//!                      0,  0,  0,  0, 0];
+//! let score_matrix: [i8; 25] = [2, -4, -4, -4, 0,
+//!                              -4, 2, -4, -4, 0,
+//!                              -4, -4, 2, -4, 0,
+//!                              -4, -4, -4, 2, 0,
+//!                               0,  0,  0,  0, 0];
 //! let query: Vec<u8> = b"ACGTACGT".iter().map(|&c| b"ACGT"[..].iter().position(|&x| x == c).unwrap() as u8).collect();
 //! let target: Vec<u8> = b"ACGTACGT".iter().map(|&c| b"ACGT"[..].iter().position(|&x| x == c).unwrap() as u8).collect();
-//! let mut ez = KswExtz::new();
-//! ksw_extz2_sse(8, &query, 8, &target, 5, &mat, 4, 2, -1, -1, 0, 0, &mut ez);
-//! assert_eq!(ez.score, 16);
-//! assert_eq!(ez.cigar, vec![8 << 4]);
+//! let mut result = KswExtz::new();
+//! ksw_extz2_sse(8, &query, 8, &target, 5, &score_matrix, 4, 2, -1, -1, 0, 0, &mut result);
+//! assert_eq!(result.score, 16);
+//! assert_eq!(result.cigar, vec![8 << 4]);
 //! ```
 
 #![allow(clippy::too_many_arguments)]
@@ -102,14 +102,14 @@ pub struct KswExtz {
 impl KswExtz {
     /// Equivalent to `memset(&ez, 0, sizeof(ez))` followed by `ksw_reset_extz()`.
     pub fn new() -> Self {
-        let mut ez = Self::default();
-        ez.reset();
-        ez
+        let mut result = Self::default();
+        result.reset();
+        result
     }
 
     /// Port of `ksw_reset_extz()`; keeps the CIGAR allocation for reuse.
     pub fn reset(&mut self) {
-        common::reset_extz(self);
+        common::reset_extension_result(self);
     }
 
     /// Number of CIGAR operations (C's `n_cigar`).
@@ -120,14 +120,18 @@ impl KswExtz {
 
     /// Render the CIGAR as a SAM string, e.g. `10M2I5M`.
     pub fn cigar_string(&self) -> String {
-        const OP: [char; 9] = ['M', 'I', 'D', 'N', '?', '?', '?', '=', 'X'];
-        let mut s = String::new();
-        for &c in &self.cigar {
-            let op = (c & 0xf) as usize;
-            s.push_str(&(c >> 4).to_string());
-            s.push(if op < OP.len() { OP[op] } else { '?' });
+        const OPERATOR_BYTE: [char; 9] = ['M', 'I', 'D', 'N', '?', '?', '?', '=', 'X'];
+        let mut rendered = String::new();
+        for &encoded in &self.cigar {
+            let operation = (encoded & 0xf) as usize;
+            rendered.push_str(&(encoded >> 4).to_string());
+            rendered.push(if operation < OPERATOR_BYTE.len() {
+                OPERATOR_BYTE[operation]
+            } else {
+                '?'
+            });
         }
-        s
+        rendered
     }
 }
 
@@ -141,52 +145,87 @@ impl KswExtz {
 /// into it (the buffer is cleared but its capacity is reused); when it is
 /// `None` only the score is computed.
 pub fn ksw_gg(
-    qlen: i32,
+    query_len: i32,
     query: &[u8],
-    tlen: i32,
+    target_len: i32,
     target: &[u8],
-    m: i8,
-    mat: &[i8],
-    gapo: i8,
-    gape: i8,
-    w: i32,
+    alphabet_size: i8,
+    score_matrix: &[i8],
+    gap_open: i8,
+    gap_extension: i8,
+    band_width: i32,
     cigar: Option<&mut Vec<u32>>,
 ) -> i32 {
-    gg::ksw_gg(qlen, query, tlen, target, m, mat, gapo, gape, w, cigar)
+    gg::ksw_gg(
+        query_len,
+        query,
+        target_len,
+        target,
+        alphabet_size,
+        score_matrix,
+        gap_open,
+        gap_extension,
+        band_width,
+        cigar,
+    )
 }
 
 /// Global alignment, Suzuki's diagonal formulation (`ksw2_gg2.c`).
 pub fn ksw_gg2(
-    qlen: i32,
+    query_len: i32,
     query: &[u8],
-    tlen: i32,
+    target_len: i32,
     target: &[u8],
-    m: i8,
-    mat: &[i8],
-    gapo: i8,
-    gape: i8,
-    w: i32,
+    alphabet_size: i8,
+    score_matrix: &[i8],
+    gap_open: i8,
+    gap_extension: i8,
+    band_width: i32,
     cigar: Option<&mut Vec<u32>>,
 ) -> i32 {
-    gg2::ksw_gg2(qlen, query, tlen, target, m, mat, gapo, gape, w, cigar)
+    gg2::ksw_gg2(
+        query_len,
+        query,
+        target_len,
+        target,
+        alphabet_size,
+        score_matrix,
+        gap_open,
+        gap_extension,
+        band_width,
+        cigar,
+    )
 }
 
 /// Global alignment with SSE intrinsics (`ksw2_gg2_sse.c`); always produces a CIGAR.
 #[cfg(target_arch = "x86_64")]
 pub fn ksw_gg2_sse(
-    qlen: i32,
+    query_len: i32,
     query: &[u8],
-    tlen: i32,
+    target_len: i32,
     target: &[u8],
-    m: i8,
-    mat: &[i8],
-    gapo: i8,
-    gape: i8,
-    w: i32,
+    alphabet_size: i8,
+    score_matrix: &[i8],
+    gap_open: i8,
+    gap_extension: i8,
+    band_width: i32,
     cigar: &mut Vec<u32>,
 ) -> i32 {
-    require_sse41();
-    unsafe { sse::gg2_sse::ksw_gg2_sse(qlen, query, tlen, target, m, mat, gapo, gape, w, cigar) }
+    require_sse41_feature();
+    unsafe {
+        sse::gg2_sse::ksw_gg2_sse(
+            query_len,
+            query,
+            target_len,
+            target,
+            alphabet_size,
+            score_matrix,
+            gap_open,
+            gap_extension,
+            band_width,
+            cigar,
+        )
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -195,43 +234,68 @@ pub fn ksw_gg2_sse(
 
 /// NW-like extension, Green's formulation (`ksw2_extz.c`).
 pub fn ksw_extz(
-    qlen: i32,
+    query_len: i32,
     query: &[u8],
-    tlen: i32,
+    target_len: i32,
     target: &[u8],
-    m: i8,
-    mat: &[i8],
-    q: i8,
-    e: i8,
-    w: i32,
-    zdrop: i32,
-    flag: i32,
-    ez: &mut KswExtz,
+    alphabet_size: i8,
+    score_matrix: &[i8],
+    gap_open: i8,
+    gap_extension: i8,
+    band_width: i32,
+    z_drop: i32,
+    flags: i32,
+    result: &mut KswExtz,
 ) {
-    extz::ksw_extz(qlen, query, tlen, target, m, mat, q, e, w, zdrop, flag, ez)
+    extz::ksw_extz(
+        query_len,
+        query,
+        target_len,
+        target,
+        alphabet_size,
+        score_matrix,
+        gap_open,
+        gap_extension,
+        band_width,
+        z_drop,
+        flags,
+        result,
+    )
 }
 
 /// NW-like extension with SSE intrinsics (`ksw2_extz2_sse.c`).
 #[cfg(target_arch = "x86_64")]
 pub fn ksw_extz2_sse(
-    qlen: i32,
+    query_len: i32,
     query: &[u8],
-    tlen: i32,
+    target_len: i32,
     target: &[u8],
-    m: i8,
-    mat: &[i8],
-    q: i8,
-    e: i8,
-    w: i32,
-    zdrop: i32,
+    alphabet_size: i8,
+    score_matrix: &[i8],
+    gap_open: i8,
+    gap_extension: i8,
+    band_width: i32,
+    z_drop: i32,
     end_bonus: i32,
-    flag: i32,
-    ez: &mut KswExtz,
+    flags: i32,
+    result: &mut KswExtz,
 ) {
-    require_sse41();
+    require_sse41_feature();
     unsafe {
         sse::extz2_sse::ksw_extz2_sse(
-            qlen, query, tlen, target, m, mat, q, e, w, zdrop, end_bonus, flag, ez,
+            query_len,
+            query,
+            target_len,
+            target,
+            alphabet_size,
+            score_matrix,
+            gap_open,
+            gap_extension,
+            band_width,
+            z_drop,
+            end_bonus,
+            flags,
+            result,
         )
     }
 }
@@ -242,23 +306,36 @@ pub fn ksw_extz2_sse(
 
 /// NW-like extension with a two-piece affine gap cost, Green's formulation (`ksw2_extd.c`).
 pub fn ksw_extd(
-    qlen: i32,
+    query_len: i32,
     query: &[u8],
-    tlen: i32,
+    target_len: i32,
     target: &[u8],
-    m: i8,
-    mat: &[i8],
-    gapo: i8,
-    gape: i8,
-    gapo2: i8,
-    gape2: i8,
-    w: i32,
-    zdrop: i32,
-    flag: i32,
-    ez: &mut KswExtz,
+    alphabet_size: i8,
+    score_matrix: &[i8],
+    gap_open: i8,
+    gap_extension: i8,
+    gap_open2: i8,
+    gap_extension2: i8,
+    band_width: i32,
+    z_drop: i32,
+    flags: i32,
+    result: &mut KswExtz,
 ) {
     extd::ksw_extd(
-        qlen, query, tlen, target, m, mat, gapo, gape, gapo2, gape2, w, zdrop, flag, ez,
+        query_len,
+        query,
+        target_len,
+        target,
+        alphabet_size,
+        score_matrix,
+        gap_open,
+        gap_extension,
+        gap_open2,
+        gap_extension2,
+        band_width,
+        z_drop,
+        flags,
+        result,
     )
 }
 
@@ -266,26 +343,40 @@ pub fn ksw_extd(
 /// (`ksw2_extd2_sse.c`).
 #[cfg(target_arch = "x86_64")]
 pub fn ksw_extd2_sse(
-    qlen: i32,
+    query_len: i32,
     query: &[u8],
-    tlen: i32,
+    target_len: i32,
     target: &[u8],
-    m: i8,
-    mat: &[i8],
-    q: i8,
-    e: i8,
-    q2: i8,
-    e2: i8,
-    w: i32,
-    zdrop: i32,
+    alphabet_size: i8,
+    score_matrix: &[i8],
+    gap_open: i8,
+    gap_extension: i8,
+    gap_open2: i8,
+    gap_extension2: i8,
+    band_width: i32,
+    z_drop: i32,
     end_bonus: i32,
-    flag: i32,
-    ez: &mut KswExtz,
+    flags: i32,
+    result: &mut KswExtz,
 ) {
-    require_sse41();
+    require_sse41_feature();
     unsafe {
         sse::extd2_sse::ksw_extd2_sse(
-            qlen, query, tlen, target, m, mat, q, e, q2, e2, w, zdrop, end_bonus, flag, ez,
+            query_len,
+            query,
+            target_len,
+            target,
+            alphabet_size,
+            score_matrix,
+            gap_open,
+            gap_extension,
+            gap_open2,
+            gap_extension2,
+            band_width,
+            z_drop,
+            end_bonus,
+            flags,
+            result,
         )
     }
 }
@@ -293,53 +384,80 @@ pub fn ksw_extd2_sse(
 /// Extension with a linear gap cost and X-drop, score only (`ksw2_extf2_sse.c`).
 #[cfg(target_arch = "x86_64")]
 pub fn ksw_extf2_sse(
-    qlen: i32,
+    query_len: i32,
     query: &[u8],
-    tlen: i32,
+    target_len: i32,
     target: &[u8],
-    mch: i8,
-    mis: i8,
-    e: i8,
-    w: i32,
-    xdrop: i32,
-    ez: &mut KswExtz,
+    match_score: i8,
+    mismatch_score: i8,
+    gap_extension: i8,
+    band_width: i32,
+    x_drop: i32,
+    result: &mut KswExtz,
 ) {
-    require_sse41();
-    unsafe { sse::extf2_sse::ksw_extf2_sse(qlen, query, tlen, target, mch, mis, e, w, xdrop, ez) }
+    require_sse41_feature();
+    unsafe {
+        sse::extf2_sse::ksw_extf2_sse(
+            query_len,
+            query,
+            target_len,
+            target,
+            match_score,
+            mismatch_score,
+            gap_extension,
+            band_width,
+            x_drop,
+            result,
+        )
+    }
 }
 
 /// Splice-aware extension with SSE intrinsics (`ksw2_exts2_sse.c`).
 ///
-/// `junc` is an optional per-target-base junction hint array (may be empty).
+/// `junctions` is an optional per-target-base junction hint array (may be empty).
 #[cfg(target_arch = "x86_64")]
 pub fn ksw_exts2_sse(
-    qlen: i32,
+    query_len: i32,
     query: &[u8],
-    tlen: i32,
+    target_len: i32,
     target: &[u8],
-    m: i8,
-    mat: &[i8],
-    q: i8,
-    e: i8,
-    q2: i8,
-    noncan: i8,
-    zdrop: i32,
-    junc_bonus: i8,
-    flag: i32,
-    junc: &[u8],
-    ez: &mut KswExtz,
+    alphabet_size: i8,
+    score_matrix: &[i8],
+    gap_open: i8,
+    gap_extension: i8,
+    gap_open2: i8,
+    non_canonical_penalty: i8,
+    z_drop: i32,
+    junction_bonus: i8,
+    flags: i32,
+    junctions: &[u8],
+    result: &mut KswExtz,
 ) {
-    require_sse41();
+    require_sse41_feature();
     unsafe {
         sse::exts2_sse::ksw_exts2_sse(
-            qlen, query, tlen, target, m, mat, q, e, q2, noncan, zdrop, junc_bonus, flag, junc, ez,
+            query_len,
+            query,
+            target_len,
+            target,
+            alphabet_size,
+            score_matrix,
+            gap_open,
+            gap_extension,
+            gap_open2,
+            non_canonical_penalty,
+            z_drop,
+            junction_bonus,
+            flags,
+            junctions,
+            result,
         )
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
-fn require_sse41() {
+fn require_sse41_feature() {
     assert!(
         std::arch::is_x86_feature_detected!("sse4.1"),
         "the *_sse entry points require the sse4.1 target feature; \
@@ -347,18 +465,36 @@ fn require_sse41() {
     );
 }
 
-/// Build a simple `m`x`m` scoring matrix, mirroring `ksw_gen_simple_mat()` of `cli.c`.
-pub fn gen_simple_mat(m: i32, mat: &mut [i8], a: i8, b: i8) {
-    let a = if a < 0 { -a } else { a };
-    let b = if b > 0 { -b } else { b };
-    let mu = m as usize;
-    for i in 0..mu - 1 {
-        for j in 0..mu - 1 {
-            mat[i * mu + j] = if i == j { a } else { b };
+/// Build a simple `alphabet_size`x`alphabet_size` scoring matrix, mirroring
+/// `ksw_gen_simple_mat()` of `cli.c`.
+pub fn gen_simple_mat(
+    alphabet_size: i32,
+    score_matrix: &mut [i8],
+    match_score: i8,
+    mismatch_score: i8,
+) {
+    let match_score = if match_score < 0 {
+        -match_score
+    } else {
+        match_score
+    };
+    let mismatch_score = if mismatch_score > 0 {
+        -mismatch_score
+    } else {
+        mismatch_score
+    };
+    let alphabet_size_usize = alphabet_size as usize;
+    for symbol in 0..alphabet_size_usize - 1 {
+        for other_symbol in 0..alphabet_size_usize - 1 {
+            score_matrix[symbol * alphabet_size_usize + other_symbol] = if symbol == other_symbol {
+                match_score
+            } else {
+                mismatch_score
+            };
         }
-        mat[i * mu + mu - 1] = 0;
+        score_matrix[symbol * alphabet_size_usize + alphabet_size_usize - 1] = 0;
     }
-    for j in 0..mu {
-        mat[(mu - 1) * mu + j] = 0;
+    for other_symbol in 0..alphabet_size_usize {
+        score_matrix[(alphabet_size_usize - 1) * alphabet_size_usize + other_symbol] = 0;
     }
 }

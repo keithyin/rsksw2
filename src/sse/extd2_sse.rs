@@ -3,623 +3,829 @@
 
 use core::arch::x86_64::*;
 
-use crate::common::{apply_zdrop, backtrack, cigar2eqx, reset_extz};
+use crate::common::{apply_z_drop, backtrack, expand_cigar_matches, reset_extension_result};
 use crate::{
     KSW_EZ_APPROX_DROP, KSW_EZ_APPROX_MAX, KSW_EZ_EQX, KSW_EZ_EXTZ_ONLY, KSW_EZ_GENERIC_SC,
     KSW_EZ_REV_CIGAR, KSW_EZ_RIGHT, KSW_EZ_SCORE_ONLY, KSW_NEG_INF, KswExtz,
 };
 
+// Backtrack byte layout (see `ksw2.h`): the low 3 bits hold the state that
+// maximises H (0 = match, 1 = deletion, 2 = insertion, 3 = intron, 4 = second
+// gap set), while bit `state + 2` records whether that state continues.
+const DELETION_STATE: i8 = 1;
+const INSERTION_STATE: i8 = 2;
+const INTRON_STATE: i8 = 3;
+const SECOND_INSERTION_STATE: i8 = 4;
+const DELETION_CONTINUATION: i8 = 0x08;
+const INSERTION_CONTINUATION: i8 = 0x10;
+const INTRON_CONTINUATION: i8 = 0x20;
+const SECOND_INSERTION_CONTINUATION: i8 = 0x40;
+
 #[target_feature(enable = "sse4.1")]
 pub(crate) unsafe fn ksw_extd2_sse(
-    qlen: i32,
+    query_len: i32,
     query: &[u8],
-    tlen: i32,
+    target_len: i32,
     target: &[u8],
-    m: i8,
-    mat: &[i8],
-    q_in: i8,
-    e_in: i8,
-    q2_in: i8,
-    e2_in: i8,
-    w: i32,
-    zdrop: i32,
+    alphabet_size: i8,
+    score_matrix: &[i8],
+    mut gap_open: i8,
+    mut gap_extension: i8,
+    mut gap_open2: i8,
+    mut gap_extension2: i8,
+    band_width: i32,
+    z_drop: i32,
     end_bonus: i32,
-    flag: i32,
-    ez: &mut KswExtz,
+    flags: i32,
+    result: &mut KswExtz,
 ) {
     unsafe {
-        reset_extz(ez);
-        if m <= 1 || qlen <= 0 || tlen <= 0 {
+        reset_extension_result(result);
+        if alphabet_size <= 1 || query_len <= 0 || target_len <= 0 {
             return;
         }
-        let mu = m as usize;
-        let qlen_u = qlen as usize;
-        let tlen_u = tlen as usize;
+        let alphabet_size_usize = alphabet_size as usize;
+        let query_len_usize = query_len as usize;
+        let target_len_usize = target_len as usize;
 
-        let mut q = q_in;
-        let mut e = e_in;
-        let mut q2 = q2_in;
-        let mut e2 = e2_in;
         // C computes `int qe = q + e` *before* this swap (ksw2_extd2_sse.c:68),
-        // so the scalar `qe` keeps the pre-swap value. It is only used for the
-        // r == 0 initialisation of H[0]/H0 below; reproduce that exactly.
-        let qe_pre_swap = q as i32 + e as i32;
-        if (q2 as i32) + (e2 as i32) < (q as i32) + (e as i32) {
-            // make sure q+e no larger than q2+e2
-            std::mem::swap(&mut q, &mut q2);
-            std::mem::swap(&mut e, &mut e2);
+        // so the scalar gap cost keeps the pre-swap value. It is only used for
+        // the anti_diagonal == 0 initialisation of H[0]/H0 below; reproduce
+        // that exactly.
+        let gap_open_plus_extension_before_swap = gap_open as i32 + gap_extension as i32;
+        if (gap_open2 as i32) + (gap_extension2 as i32) < (gap_open as i32) + (gap_extension as i32) {
+            // make sure gap_open+gap_extension is no larger than gap_open2+gap_extension2
+            std::mem::swap(&mut gap_open, &mut gap_open2);
+            std::mem::swap(&mut gap_extension, &mut gap_extension2);
         }
-        let q_i = q as i32;
-        let e_i = e as i32;
-        let q2_i = q2 as i32;
-        let e2_i = e2 as i32;
-        let qe = q_i + e_i;
+        let gap_open_i32 = gap_open as i32;
+        let gap_extension_i32 = gap_extension as i32;
+        let gap_open2_i32 = gap_open2 as i32;
+        let gap_extension2_i32 = gap_extension2 as i32;
+        let gap_open_plus_extension = gap_open_i32 + gap_extension_i32;
+        let gap_open2_plus_extension2 = gap_open2_i32 + gap_extension2_i32;
 
-        let zero_ = _mm_setzero_si128();
-        let q_ = _mm_set1_epi8(q);
-        let q2_ = _mm_set1_epi8(q2);
-        let qe_ = _mm_set1_epi8(qe as i8);
-        let qe2_ = _mm_set1_epi8((q2_i + e2_i) as i8);
-        let sc_mch_ = _mm_set1_epi8(mat[0]);
-        let sc_mis_ = _mm_set1_epi8(mat[1]);
-        let sc_n = mat[mu * mu - 1];
-        let sc_amb_ = if sc_n == 0 { _mm_set1_epi8(-e2) } else { _mm_set1_epi8(sc_n) };
-        let m1_ = _mm_set1_epi8((m as i32 - 1) as i8); // wildcard
+        let zero_vector = _mm_setzero_si128();
+        let gap_open_vector = _mm_set1_epi8(gap_open);
+        let gap_open2_vector = _mm_set1_epi8(gap_open2);
+        let gap_open_plus_extension_vector = _mm_set1_epi8(gap_open_plus_extension as i8);
+        let gap_open2_plus_extension2_vector = _mm_set1_epi8(gap_open2_plus_extension2 as i8);
+        let match_score_vector = _mm_set1_epi8(score_matrix[0]);
+        let mismatch_score_vector = _mm_set1_epi8(score_matrix[1]);
+        let wildcard_score = score_matrix[alphabet_size_usize * alphabet_size_usize - 1];
+        let ambiguous_score_vector = if wildcard_score == 0 {
+            _mm_set1_epi8(-gap_extension2)
+        } else {
+            _mm_set1_epi8(wildcard_score)
+        };
+        // wildcard symbol, i.e. the last row/column of the scoring matrix
+        let wildcard_symbol_vector = _mm_set1_epi8((alphabet_size as i32 - 1) as i8);
 
-        let w = if w < 0 { if tlen > qlen { tlen } else { qlen } } else { w };
-        let wl = w;
-        let wr = w;
-        let tlen_ = ((tlen + 15) / 16) as usize;
-        let n_col0 = if qlen < tlen { qlen } else { tlen };
-        let n_col0 = if n_col0 < w + 1 { n_col0 } else { w + 1 };
-        let n_col_ = ((n_col0 + 15) / 16 + 1) as usize;
-        let qlen_ = ((qlen + 15) / 16) as usize;
-        let mut max_sc = mat[0] as i32;
-        let mut min_sc = mat.get(1).copied().unwrap_or(0) as i32;
-        for t in 1..mu * mu {
-            let vv = mat[t] as i32;
-            if vv > max_sc {
-                max_sc = vv;
+        let band_width = if band_width < 0 {
+            if target_len > query_len {
+                target_len
+            } else {
+                query_len
             }
-            if vv < min_sc {
-                min_sc = vv;
+        } else {
+            band_width
+        };
+        let band_width_left = band_width;
+        let band_width_right = band_width;
+        let target_block_count = ((target_len + 15) / 16) as usize;
+        let max_backtrack_columns = if query_len < target_len {
+            query_len
+        } else {
+            target_len
+        };
+        let max_backtrack_columns = if max_backtrack_columns < band_width + 1 {
+            max_backtrack_columns
+        } else {
+            band_width + 1
+        };
+        let backtrack_blocks = ((max_backtrack_columns + 15) / 16 + 1) as usize;
+        let query_block_count = ((query_len + 15) / 16) as usize;
+        let mut max_matrix_score = score_matrix[0] as i32;
+        let mut min_matrix_score = score_matrix.get(1).copied().unwrap_or(0) as i32;
+        for matrix_index in 1..alphabet_size_usize * alphabet_size_usize {
+            let matrix_score = score_matrix[matrix_index] as i32;
+            if matrix_score > max_matrix_score {
+                max_matrix_score = matrix_score;
+            }
+            if matrix_score < min_matrix_score {
+                min_matrix_score = matrix_score;
             }
         }
-        let _ = max_sc;
-        if -min_sc > 2 * qe {
+        let _ = max_matrix_score;
+        if -min_matrix_score > 2 * gap_open_plus_extension {
             return; // otherwise, we won't see any mismatches
         }
 
-        let long_thres: i32;
-        if e != e2 {
-            long_thres = (q2_i - q_i) / (e_i - e2_i) - 1;
+        let long_gap_threshold: i32;
+        if gap_extension != gap_extension2 {
+            long_gap_threshold =
+                (gap_open2_i32 - gap_open_i32) / (gap_extension_i32 - gap_extension2_i32) - 1;
         } else {
-            long_thres = 0;
+            long_gap_threshold = 0;
         }
-        let mut long_thres = long_thres;
-        if q2_i + e2_i + long_thres * e2_i > q_i + e_i + long_thres * e_i {
-            long_thres += 1;
+        let mut long_gap_threshold = long_gap_threshold;
+        if gap_open2_i32 + gap_extension2_i32 + long_gap_threshold * gap_extension2_i32
+            > gap_open_i32 + gap_extension_i32 + long_gap_threshold * gap_extension_i32
+        {
+            long_gap_threshold += 1;
         }
-        let long_diff = long_thres * (e_i - e2_i) - (q2_i - q_i) - e2_i;
+        let long_gap_difference = long_gap_threshold * (gap_extension_i32 - gap_extension2_i32)
+            - (gap_open2_i32 - gap_open_i32)
+            - gap_extension2_i32;
 
-        let with_cigar = (flag & KSW_EZ_SCORE_ONLY) == 0;
-        let approx_max = (flag & KSW_EZ_APPROX_MAX) != 0;
-        let mut u = vec![zero_; tlen_];
-        let mut v = vec![zero_; tlen_];
-        let mut x = vec![zero_; tlen_];
-        let mut y = vec![zero_; tlen_];
-        let mut x2 = vec![zero_; tlen_];
-        let mut y2 = vec![zero_; tlen_];
-        let mut s = vec![zero_; tlen_ + 1];
-        let mut sf = vec![0u8; tlen_ * 16 + 16];
-        let mut qr = vec![0u8; (qlen_ + 1) * 16];
-        let mut h: Vec<i32> = if approx_max { Vec::new() } else { vec![KSW_NEG_INF; tlen_ * 16 + 4] };
-        let n_rows = (qlen + tlen - 1) as usize;
-        let mut p: Vec<u8> = Vec::new();
-        let mut off: Vec<i32> = Vec::new();
-        let mut off_end: Vec<i32> = Vec::new();
-        if with_cigar {
-            p = vec![0u8; (n_rows * n_col_ + 1) * 16];
-            off = vec![0i32; n_rows];
-            off_end = vec![0i32; n_rows];
+        let record_cigar = (flags & KSW_EZ_SCORE_ONLY) == 0;
+        let approximate_max = (flags & KSW_EZ_APPROX_MAX) != 0;
+        let mut u = vec![zero_vector; target_block_count];
+        let mut v = vec![zero_vector; target_block_count];
+        let mut x = vec![zero_vector; target_block_count];
+        let mut y = vec![zero_vector; target_block_count];
+        let mut x2 = vec![zero_vector; target_block_count];
+        let mut y2 = vec![zero_vector; target_block_count];
+        let mut s = vec![zero_vector; target_block_count + 1];
+        let mut padded_target = vec![0u8; target_block_count * 16 + 16];
+        let mut reverse_query = vec![0u8; (query_block_count + 1) * 16];
+        let mut score_table: Vec<i32> = if approximate_max {
+            Vec::new()
+        } else {
+            vec![KSW_NEG_INF; target_block_count * 16 + 4]
+        };
+        let row_count = (query_len + target_len - 1) as usize;
+        let mut backtrack_matrix: Vec<u8> = Vec::new();
+        let mut band_start_per_row: Vec<i32> = Vec::new();
+        let mut band_end_per_row: Vec<i32> = Vec::new();
+        if record_cigar {
+            backtrack_matrix = vec![0u8; (row_count * backtrack_blocks + 1) * 16];
+            band_start_per_row = vec![0i32; row_count];
+            band_end_per_row = vec![0i32; row_count];
         }
 
-        for t in 0..qlen_u {
-            qr[t] = query[qlen_u - 1 - t];
+        for query_index in 0..query_len_usize {
+            reverse_query[query_index] = query[query_len_usize - 1 - query_index];
         }
-        sf[..tlen_u].copy_from_slice(&target[..tlen_u]);
+        padded_target[..target_len_usize].copy_from_slice(&target[..target_len_usize]);
 
         // initialisation of the u/v/x/y/x2/y2 arrays (C uses memset())
         {
-            let lane = _mm_set1_epi8((-qe) as i8);
-            for i in 0..tlen_ {
-                u[i] = lane;
-                v[i] = lane;
-                x[i] = lane;
-                y[i] = lane;
+            let initial_lane = _mm_set1_epi8((-gap_open_plus_extension) as i8);
+            for block_index in 0..target_block_count {
+                u[block_index] = initial_lane;
+                v[block_index] = initial_lane;
+                x[block_index] = initial_lane;
+                y[block_index] = initial_lane;
             }
-            let lane2 = _mm_set1_epi8((-(q2_i + e2_i)) as i8);
-            for i in 0..tlen_ {
-                x2[i] = lane2;
-                y2[i] = lane2;
+            let initial_second_lane = _mm_set1_epi8((-gap_open2_plus_extension2) as i8);
+            for block_index in 0..target_block_count {
+                x2[block_index] = initial_second_lane;
+                y2[block_index] = initial_second_lane;
             }
         }
 
-        let up = u.as_mut_ptr() as *mut i8;
-        let vp = v.as_mut_ptr() as *mut i8;
-        let xp = x.as_mut_ptr() as *mut i8;
-        let x2p = x2.as_mut_ptr() as *mut i8;
-        let yp = y.as_mut_ptr() as *mut i8;
-        let y2p = y2.as_mut_ptr() as *mut i8;
-        let sp = s.as_mut_ptr() as *mut u8;
-        let sfp = sf.as_ptr();
-        let qrp = qr.as_ptr();
+        let u_ptr = u.as_mut_ptr() as *mut i8;
+        let v_ptr = v.as_mut_ptr() as *mut i8;
+        let x_ptr = x.as_mut_ptr() as *mut i8;
+        let x2_ptr = x2.as_mut_ptr() as *mut i8;
+        let y_ptr = y.as_mut_ptr() as *mut i8;
+        let y2_ptr = y2.as_mut_ptr() as *mut i8;
+        let s_ptr = s.as_mut_ptr() as *mut u8;
+        let padded_target_ptr = padded_target.as_ptr();
+        let reverse_query_ptr = reverse_query.as_ptr();
 
-        let mut last_st = -1i32;
-        let mut last_en = -1i32;
-        let mut h0 = 0i32;
-        let mut last_h0_t = 0i32;
+        let mut previous_band_start = -1i32;
+        let mut previous_band_end = -1i32;
+        let mut diagonal_score = 0i32;
+        let mut diagonal_score_target_index = 0i32;
 
-        for r in 0..qlen + tlen - 1 {
-            let mut st = 0i32;
-            let mut en = tlen - 1;
+        for anti_diagonal in 0..query_len + target_len - 1 {
+            let mut band_start = 0i32;
+            let mut band_end = target_len - 1;
             // find the boundaries
-            if st < r - qlen + 1 {
-                st = r - qlen + 1;
+            if band_start < anti_diagonal - query_len + 1 {
+                band_start = anti_diagonal - query_len + 1;
             }
-            if en > r {
-                en = r;
+            if band_end > anti_diagonal {
+                band_end = anti_diagonal;
             }
-            if st < (r - wr + 1) >> 1 {
-                st = (r - wr + 1) >> 1; // take the ceil
+            if band_start < (anti_diagonal - band_width_right + 1) >> 1 {
+                band_start = (anti_diagonal - band_width_right + 1) >> 1; // take the ceil
             }
-            if en > (r + wl) >> 1 {
-                en = (r + wl) >> 1; // take the floor
+            if band_end > (anti_diagonal + band_width_left) >> 1 {
+                band_end = (anti_diagonal + band_width_left) >> 1; // take the floor
             }
-            if st > en {
-                ez.zdropped = true;
+            if band_start > band_end {
+                result.zdropped = true;
                 break;
             }
-            let st0 = st;
-            let en0 = en;
-            st = st / 16 * 16;
-            en = (en + 16) / 16 * 16 - 1;
+            let unpadded_band_start = band_start;
+            let unpadded_band_end = band_end;
+            band_start = band_start / 16 * 16;
+            band_end = (band_end + 16) / 16 * 16 - 1;
             // set boundary conditions
-            let x1: i8;
-            let x21: i8;
-            let v1: i8;
-            if st > 0 {
-                if st - 1 >= last_st && st - 1 <= last_en {
-                    x1 = *xp.add((st - 1) as usize); // (r-1,s-1) calculated in the last round
-                    x21 = *x2p.add((st - 1) as usize);
-                    v1 = *vp.add((st - 1) as usize);
+            let previous_x: i8;
+            let previous_x2: i8;
+            let previous_v: i8;
+            if band_start > 0 {
+                if band_start - 1 >= previous_band_start && band_start - 1 <= previous_band_end {
+                    // (anti_diagonal-1, band_start-1) calculated in the last round
+                    previous_x = *x_ptr.add((band_start - 1) as usize);
+                    previous_x2 = *x2_ptr.add((band_start - 1) as usize);
+                    previous_v = *v_ptr.add((band_start - 1) as usize);
                 } else {
-                    x1 = (-qe) as i8;
-                    x21 = (-(q2_i + e2_i)) as i8;
-                    v1 = (-qe) as i8;
+                    previous_x = (-gap_open_plus_extension) as i8;
+                    previous_x2 = (-gap_open2_plus_extension2) as i8;
+                    previous_v = (-gap_open_plus_extension) as i8;
                 }
             } else {
-                x1 = (-qe) as i8;
-                x21 = (-(q2_i + e2_i)) as i8;
-                v1 = if r == 0 {
-                    (-qe) as i8
-                } else if r < long_thres {
-                    (-e_i) as i8
-                } else if r == long_thres {
-                    long_diff as i8
+                previous_x = (-gap_open_plus_extension) as i8;
+                previous_x2 = (-gap_open2_plus_extension2) as i8;
+                previous_v = if anti_diagonal == 0 {
+                    (-gap_open_plus_extension) as i8
+                } else if anti_diagonal < long_gap_threshold {
+                    (-gap_extension_i32) as i8
+                } else if anti_diagonal == long_gap_threshold {
+                    long_gap_difference as i8
                 } else {
-                    (-e2_i) as i8
+                    (-gap_extension2_i32) as i8
                 };
             }
-            if en >= r {
-                *yp.add(r as usize) = (-qe) as i8;
-                *y2p.add(r as usize) = (-(q2_i + e2_i)) as i8;
-                *up.add(r as usize) = if r == 0 {
-                    (-qe) as i8
-                } else if r < long_thres {
-                    (-e_i) as i8
-                } else if r == long_thres {
-                    long_diff as i8
+            if band_end >= anti_diagonal {
+                *y_ptr.add(anti_diagonal as usize) = (-gap_open_plus_extension) as i8;
+                *y2_ptr.add(anti_diagonal as usize) = (-gap_open2_plus_extension2) as i8;
+                *u_ptr.add(anti_diagonal as usize) = if anti_diagonal == 0 {
+                    (-gap_open_plus_extension) as i8
+                } else if anti_diagonal < long_gap_threshold {
+                    (-gap_extension_i32) as i8
+                } else if anti_diagonal == long_gap_threshold {
+                    long_gap_difference as i8
                 } else {
-                    (-e2_i) as i8
+                    (-gap_extension2_i32) as i8
                 };
             }
             // loop fission: set scores first
-            let qrr_base = qlen_u as isize - 1 - r as isize;
-            if (flag & KSW_EZ_GENERIC_SC) == 0 {
-                let mut t = st0;
-                while t <= en0 {
-                    let tu = t as usize;
-                    let sq = _mm_loadu_si128(sfp.add(tu) as *const __m128i);
-                    let stq =
-                        _mm_loadu_si128(qrp.offset(qrr_base + t as isize) as *const __m128i);
-                    let mask = _mm_or_si128(_mm_cmpeq_epi8(sq, m1_), _mm_cmpeq_epi8(stq, m1_));
-                    let mut tmp = _mm_cmpeq_epi8(sq, stq);
-                    tmp = _mm_blendv_epi8(sc_mis_, sc_mch_, tmp);
-                    tmp = _mm_blendv_epi8(tmp, sc_amb_, mask);
-                    _mm_storeu_si128(sp.add(tu) as *mut __m128i, tmp);
-                    t += 16;
+            let reverse_query_base = query_len_usize as isize - 1 - anti_diagonal as isize;
+            if (flags & KSW_EZ_GENERIC_SC) == 0 {
+                let mut target_index = unpadded_band_start;
+                while target_index <= unpadded_band_end {
+                    let target_index_usize = target_index as usize;
+                    let target_block =
+                        _mm_loadu_si128(padded_target_ptr.add(target_index_usize) as *const __m128i);
+                    let query_block = _mm_loadu_si128(
+                        reverse_query_ptr.offset(reverse_query_base + target_index as isize)
+                            as *const __m128i,
+                    );
+                    let wildcard_mask = _mm_or_si128(
+                        _mm_cmpeq_epi8(target_block, wildcard_symbol_vector),
+                        _mm_cmpeq_epi8(query_block, wildcard_symbol_vector),
+                    );
+                    let mut score_block = _mm_cmpeq_epi8(target_block, query_block);
+                    score_block = _mm_blendv_epi8(mismatch_score_vector, match_score_vector, score_block);
+                    score_block = _mm_blendv_epi8(score_block, ambiguous_score_vector, wildcard_mask);
+                    _mm_storeu_si128(s_ptr.add(target_index_usize) as *mut __m128i, score_block);
+                    target_index += 16;
                 }
             } else {
-                let mut t = st0;
-                while t <= en0 {
-                    let tu = t as usize;
-                    *sp.add(tu) = mat[*sfp.add(tu) as usize * mu
-                        + *qrp.offset(qrr_base + t as isize) as usize]
+                let mut target_index = unpadded_band_start;
+                while target_index <= unpadded_band_end {
+                    let target_index_usize = target_index as usize;
+                    *s_ptr.add(target_index_usize) = score_matrix[*padded_target_ptr.add(target_index_usize)
+                        as usize
+                        * alphabet_size_usize
+                        + *reverse_query_ptr.offset(reverse_query_base + target_index as isize) as usize]
                         as u8;
-                    t += 1;
+                    target_index += 1;
                 }
             }
             // core loop
-            let mut x1_ = _mm_cvtsi32_si128((x1 as u8) as i32); // C: (uint8_t)x1
-            let mut x21_ = _mm_cvtsi32_si128((x21 as u8) as i32); // C: (uint8_t)x21
-            let mut v1_ = _mm_cvtsi32_si128((v1 as u8) as i32); // C: (uint8_t)v1
-            let st_ = (st / 16) as usize;
-            let en_ = (en / 16) as usize;
-            assert!(en_ - st_ + 1 <= n_col_);
-            if !with_cigar {
+            let mut previous_x_vector = _mm_cvtsi32_si128((previous_x as u8) as i32); // C: (uint8_t)x1
+            let mut previous_x2_vector = _mm_cvtsi32_si128((previous_x2 as u8) as i32); // C: (uint8_t)x21
+            let mut previous_v_vector = _mm_cvtsi32_si128((previous_v as u8) as i32); // C: (uint8_t)v1
+            let block_start = (band_start / 16) as usize;
+            let block_end = (band_end / 16) as usize;
+            assert!(block_end - block_start + 1 <= backtrack_blocks);
+            if !record_cigar {
                 // score only
-                let mut t = st_;
-                while t <= en_ {
-                    let mut z = _mm_load_si128(s.as_ptr().add(t));
-                    let mut xt1 = _mm_load_si128(x.as_ptr().add(t)); // xt1 <- x[r-1][t..t+15]
-                    let mut tmp = _mm_srli_si128::<15>(xt1); // tmp <- x[r-1][t+15]
-                    xt1 = _mm_or_si128(_mm_slli_si128::<1>(xt1), x1_); // xt1 <- x[r-1][t-1..t+14]
-                    x1_ = tmp;
-                    let mut vt1 = _mm_load_si128(v.as_ptr().add(t)); // vt1 <- v[r-1][t..t+15]
-                    tmp = _mm_srli_si128::<15>(vt1); // tmp <- v[r-1][t+15]
-                    vt1 = _mm_or_si128(_mm_slli_si128::<1>(vt1), v1_); // vt1 <- v[r-1][t-1..t+14]
-                    v1_ = tmp;
-                    let mut a = _mm_add_epi8(xt1, vt1); // a <- x[r-1][t-1..t+14] + v[r-1][t-1..t+14]
-                    let ut = _mm_load_si128(u.as_ptr().add(t)); // ut <- u[t..t+15]
-                    let mut b = _mm_add_epi8(_mm_load_si128(y.as_ptr().add(t)), ut); // b <- y[r-1][t..t+15] + u[r-1][t..t+15]
-                    let mut x2t1 = _mm_load_si128(x2.as_ptr().add(t));
-                    tmp = _mm_srli_si128::<15>(x2t1);
-                    x2t1 = _mm_or_si128(_mm_slli_si128::<1>(x2t1), x21_);
-                    x21_ = tmp;
-                    let mut a2 = _mm_add_epi8(x2t1, vt1);
-                    let mut b2 = _mm_add_epi8(_mm_load_si128(y2.as_ptr().add(t)), ut);
-                    z = _mm_max_epi8(z, a);
-                    z = _mm_max_epi8(z, b);
-                    z = _mm_max_epi8(z, a2);
-                    z = _mm_max_epi8(z, b2);
-                    z = _mm_min_epi8(z, sc_mch_);
-                    // save u[] and v[]; update a, b, a2 and b2
-                    _mm_store_si128(u.as_mut_ptr().add(t), _mm_sub_epi8(z, vt1)); // u[r][t..t+15] <- z - v[r-1][t-1..t+14]
-                    _mm_store_si128(v.as_mut_ptr().add(t), _mm_sub_epi8(z, ut)); // v[r][t..t+15] <- z - u[r-1][t..t+15]
-                    tmp = _mm_sub_epi8(z, q_);
-                    a = _mm_sub_epi8(a, tmp);
-                    b = _mm_sub_epi8(b, tmp);
-                    tmp = _mm_sub_epi8(z, q2_);
-                    a2 = _mm_sub_epi8(a2, tmp);
-                    b2 = _mm_sub_epi8(b2, tmp);
-                    _mm_store_si128(x.as_mut_ptr().add(t), _mm_sub_epi8(_mm_max_epi8(a, zero_), qe_));
-                    _mm_store_si128(y.as_mut_ptr().add(t), _mm_sub_epi8(_mm_max_epi8(b, zero_), qe_));
+                let mut block = block_start;
+                while block <= block_end {
+                    let mut max_score_vector = _mm_load_si128(s.as_ptr().add(block));
+                    let mut x_previous_block = _mm_load_si128(x.as_ptr().add(block));
+                    let mut temporary = _mm_srli_si128::<15>(x_previous_block);
+                    x_previous_block =
+                        _mm_or_si128(_mm_slli_si128::<1>(x_previous_block), previous_x_vector);
+                    previous_x_vector = temporary;
+                    let mut v_previous_block = _mm_load_si128(v.as_ptr().add(block));
+                    temporary = _mm_srli_si128::<15>(v_previous_block);
+                    v_previous_block =
+                        _mm_or_si128(_mm_slli_si128::<1>(v_previous_block), previous_v_vector);
+                    previous_v_vector = temporary;
+                    // candidate_from_x <- x[r-1][t-1..t+14] + v[r-1][t-1..t+14]
+                    let mut candidate_from_x = _mm_add_epi8(x_previous_block, v_previous_block);
+                    let u_current_block = _mm_load_si128(u.as_ptr().add(block));
+                    // candidate_from_y <- y[r-1][t..t+15] + u[r-1][t..t+15]
+                    let mut candidate_from_y =
+                        _mm_add_epi8(_mm_load_si128(y.as_ptr().add(block)), u_current_block);
+                    // same for the second gap set
+                    let mut x2_previous_block = _mm_load_si128(x2.as_ptr().add(block));
+                    temporary = _mm_srli_si128::<15>(x2_previous_block);
+                    x2_previous_block =
+                        _mm_or_si128(_mm_slli_si128::<1>(x2_previous_block), previous_x2_vector);
+                    previous_x2_vector = temporary;
+                    let mut candidate_from_x2 = _mm_add_epi8(x2_previous_block, v_previous_block);
+                    let mut candidate_from_y2 =
+                        _mm_add_epi8(_mm_load_si128(y2.as_ptr().add(block)), u_current_block);
+                    max_score_vector = _mm_max_epi8(max_score_vector, candidate_from_x);
+                    max_score_vector = _mm_max_epi8(max_score_vector, candidate_from_y);
+                    max_score_vector = _mm_max_epi8(max_score_vector, candidate_from_x2);
+                    max_score_vector = _mm_max_epi8(max_score_vector, candidate_from_y2);
+                    max_score_vector = _mm_min_epi8(max_score_vector, match_score_vector);
+                    // save u[] and v[]; update the candidates
+                    // u[r][t..t+15] <- z - v[r-1][t-1..t+14]
                     _mm_store_si128(
-                        x2.as_mut_ptr().add(t),
-                        _mm_sub_epi8(_mm_max_epi8(a2, zero_), qe2_),
+                        u.as_mut_ptr().add(block),
+                        _mm_sub_epi8(max_score_vector, v_previous_block),
+                    );
+                    // v[r][t..t+15] <- z - u[r-1][t..t+15]
+                    _mm_store_si128(
+                        v.as_mut_ptr().add(block),
+                        _mm_sub_epi8(max_score_vector, u_current_block),
+                    );
+                    temporary = _mm_sub_epi8(max_score_vector, gap_open_vector);
+                    candidate_from_x = _mm_sub_epi8(candidate_from_x, temporary);
+                    candidate_from_y = _mm_sub_epi8(candidate_from_y, temporary);
+                    temporary = _mm_sub_epi8(max_score_vector, gap_open2_vector);
+                    candidate_from_x2 = _mm_sub_epi8(candidate_from_x2, temporary);
+                    candidate_from_y2 = _mm_sub_epi8(candidate_from_y2, temporary);
+                    _mm_store_si128(
+                        x.as_mut_ptr().add(block),
+                        _mm_sub_epi8(_mm_max_epi8(candidate_from_x, zero_vector), gap_open_plus_extension_vector),
                     );
                     _mm_store_si128(
-                        y2.as_mut_ptr().add(t),
-                        _mm_sub_epi8(_mm_max_epi8(b2, zero_), qe2_),
+                        y.as_mut_ptr().add(block),
+                        _mm_sub_epi8(_mm_max_epi8(candidate_from_y, zero_vector), gap_open_plus_extension_vector),
                     );
-                    t += 1;
+                    _mm_store_si128(
+                        x2.as_mut_ptr().add(block),
+                        _mm_sub_epi8(
+                            _mm_max_epi8(candidate_from_x2, zero_vector),
+                            gap_open2_plus_extension2_vector,
+                        ),
+                    );
+                    _mm_store_si128(
+                        y2.as_mut_ptr().add(block),
+                        _mm_sub_epi8(
+                            _mm_max_epi8(candidate_from_y2, zero_vector),
+                            gap_open2_plus_extension2_vector,
+                        ),
+                    );
+                    block += 1;
                 }
-            } else if (flag & KSW_EZ_RIGHT) == 0 {
+            } else if (flags & KSW_EZ_RIGHT) == 0 {
                 // gap left-alignment
-                let pr_off = r as usize * n_col_ * 16 - st as usize;
-                off[r as usize] = st;
-                off_end[r as usize] = en;
-                let mut t = st_;
-                while t <= en_ {
-                    let mut z = _mm_load_si128(s.as_ptr().add(t));
-                    let mut xt1 = _mm_load_si128(x.as_ptr().add(t));
-                    let mut tmp = _mm_srli_si128::<15>(xt1);
-                    xt1 = _mm_or_si128(_mm_slli_si128::<1>(xt1), x1_);
-                    x1_ = tmp;
-                    let mut vt1 = _mm_load_si128(v.as_ptr().add(t));
-                    tmp = _mm_srli_si128::<15>(vt1);
-                    vt1 = _mm_or_si128(_mm_slli_si128::<1>(vt1), v1_);
-                    v1_ = tmp;
-                    let mut a = _mm_add_epi8(xt1, vt1);
-                    let ut = _mm_load_si128(u.as_ptr().add(t));
-                    let mut b = _mm_add_epi8(_mm_load_si128(y.as_ptr().add(t)), ut);
-                    let mut x2t1 = _mm_load_si128(x2.as_ptr().add(t));
-                    tmp = _mm_srli_si128::<15>(x2t1);
-                    x2t1 = _mm_or_si128(_mm_slli_si128::<1>(x2t1), x21_);
-                    x21_ = tmp;
-                    let mut a2 = _mm_add_epi8(x2t1, vt1);
-                    let mut b2 = _mm_add_epi8(_mm_load_si128(y2.as_ptr().add(t)), ut);
+                let backtrack_row_offset =
+                    anti_diagonal as usize * backtrack_blocks * 16 - band_start as usize;
+                band_start_per_row[anti_diagonal as usize] = band_start;
+                band_end_per_row[anti_diagonal as usize] = band_end;
+                let mut block = block_start;
+                while block <= block_end {
+                    let mut max_score_vector = _mm_load_si128(s.as_ptr().add(block));
+                    let mut x_previous_block = _mm_load_si128(x.as_ptr().add(block));
+                    let mut temporary = _mm_srli_si128::<15>(x_previous_block);
+                    x_previous_block =
+                        _mm_or_si128(_mm_slli_si128::<1>(x_previous_block), previous_x_vector);
+                    previous_x_vector = temporary;
+                    let mut v_previous_block = _mm_load_si128(v.as_ptr().add(block));
+                    temporary = _mm_srli_si128::<15>(v_previous_block);
+                    v_previous_block =
+                        _mm_or_si128(_mm_slli_si128::<1>(v_previous_block), previous_v_vector);
+                    previous_v_vector = temporary;
+                    let mut candidate_from_x = _mm_add_epi8(x_previous_block, v_previous_block);
+                    let u_current_block = _mm_load_si128(u.as_ptr().add(block));
+                    let mut candidate_from_y =
+                        _mm_add_epi8(_mm_load_si128(y.as_ptr().add(block)), u_current_block);
+                    let mut x2_previous_block = _mm_load_si128(x2.as_ptr().add(block));
+                    temporary = _mm_srli_si128::<15>(x2_previous_block);
+                    x2_previous_block =
+                        _mm_or_si128(_mm_slli_si128::<1>(x2_previous_block), previous_x2_vector);
+                    previous_x2_vector = temporary;
+                    let mut candidate_from_x2 = _mm_add_epi8(x2_previous_block, v_previous_block);
+                    let mut candidate_from_y2 =
+                        _mm_add_epi8(_mm_load_si128(y2.as_ptr().add(block)), u_current_block);
 
-                    let mut d = _mm_and_si128(_mm_cmpgt_epi8(a, z), _mm_set1_epi8(1)); // d = a  > z? 1 : 0
-                    z = _mm_max_epi8(z, a);
-                    d = _mm_blendv_epi8(d, _mm_set1_epi8(2), _mm_cmpgt_epi8(b, z)); // d = b  > z? 2 : d
-                    z = _mm_max_epi8(z, b);
-                    d = _mm_blendv_epi8(d, _mm_set1_epi8(3), _mm_cmpgt_epi8(a2, z)); // d = a2 > z? 3 : d
-                    z = _mm_max_epi8(z, a2);
-                    d = _mm_blendv_epi8(d, _mm_set1_epi8(4), _mm_cmpgt_epi8(b2, z)); // d = b2 > z? 4 : d
-                    z = _mm_max_epi8(z, b2);
-                    z = _mm_min_epi8(z, sc_mch_);
-                    // save u[] and v[]; update a, b, a2 and b2
-                    _mm_store_si128(u.as_mut_ptr().add(t), _mm_sub_epi8(z, vt1));
-                    _mm_store_si128(v.as_mut_ptr().add(t), _mm_sub_epi8(z, ut));
-                    tmp = _mm_sub_epi8(z, q_);
-                    a = _mm_sub_epi8(a, tmp);
-                    b = _mm_sub_epi8(b, tmp);
-                    tmp = _mm_sub_epi8(z, q2_);
-                    a2 = _mm_sub_epi8(a2, tmp);
-                    b2 = _mm_sub_epi8(b2, tmp);
+                    let mut backtrack_byte_vector = _mm_and_si128(
+                        _mm_cmpgt_epi8(candidate_from_x, max_score_vector),
+                        _mm_set1_epi8(DELETION_STATE),
+                    ); // 1 when candidate_from_x > z
+                    max_score_vector = _mm_max_epi8(max_score_vector, candidate_from_x);
+                    backtrack_byte_vector = _mm_blendv_epi8(
+                        backtrack_byte_vector,
+                        _mm_set1_epi8(INSERTION_STATE),
+                        _mm_cmpgt_epi8(candidate_from_y, max_score_vector),
+                    ); // 2 when candidate_from_y > z
+                    max_score_vector = _mm_max_epi8(max_score_vector, candidate_from_y);
+                    backtrack_byte_vector = _mm_blendv_epi8(
+                        backtrack_byte_vector,
+                        _mm_set1_epi8(INTRON_STATE),
+                        _mm_cmpgt_epi8(candidate_from_x2, max_score_vector),
+                    ); // 3 when candidate_from_x2 > z
+                    max_score_vector = _mm_max_epi8(max_score_vector, candidate_from_x2);
+                    backtrack_byte_vector = _mm_blendv_epi8(
+                        backtrack_byte_vector,
+                        _mm_set1_epi8(SECOND_INSERTION_STATE),
+                        _mm_cmpgt_epi8(candidate_from_y2, max_score_vector),
+                    ); // 4 when candidate_from_y2 > z
+                    max_score_vector = _mm_max_epi8(max_score_vector, candidate_from_y2);
+                    max_score_vector = _mm_min_epi8(max_score_vector, match_score_vector);
+                    // save u[] and v[]; update the candidates
+                    _mm_store_si128(
+                        u.as_mut_ptr().add(block),
+                        _mm_sub_epi8(max_score_vector, v_previous_block),
+                    );
+                    _mm_store_si128(
+                        v.as_mut_ptr().add(block),
+                        _mm_sub_epi8(max_score_vector, u_current_block),
+                    );
+                    temporary = _mm_sub_epi8(max_score_vector, gap_open_vector);
+                    candidate_from_x = _mm_sub_epi8(candidate_from_x, temporary);
+                    candidate_from_y = _mm_sub_epi8(candidate_from_y, temporary);
+                    temporary = _mm_sub_epi8(max_score_vector, gap_open2_vector);
+                    candidate_from_x2 = _mm_sub_epi8(candidate_from_x2, temporary);
+                    candidate_from_y2 = _mm_sub_epi8(candidate_from_y2, temporary);
 
-                    tmp = _mm_cmpgt_epi8(a, zero_);
+                    temporary = _mm_cmpgt_epi8(candidate_from_x, zero_vector);
                     _mm_store_si128(
-                        x.as_mut_ptr().add(t),
-                        _mm_sub_epi8(_mm_and_si128(tmp, a), qe_),
+                        x.as_mut_ptr().add(block),
+                        _mm_sub_epi8(_mm_and_si128(temporary, candidate_from_x), gap_open_plus_extension_vector),
                     );
-                    d = _mm_or_si128(d, _mm_and_si128(tmp, _mm_set1_epi8(0x08))); // d = a > 0? 1<<3 : 0
-                    tmp = _mm_cmpgt_epi8(b, zero_);
+                    backtrack_byte_vector = _mm_or_si128(
+                        backtrack_byte_vector,
+                        _mm_and_si128(temporary, _mm_set1_epi8(DELETION_CONTINUATION)),
+                    ); // the E state continues while candidate_from_x > 0
+                    temporary = _mm_cmpgt_epi8(candidate_from_y, zero_vector);
                     _mm_store_si128(
-                        y.as_mut_ptr().add(t),
-                        _mm_sub_epi8(_mm_and_si128(tmp, b), qe_),
+                        y.as_mut_ptr().add(block),
+                        _mm_sub_epi8(_mm_and_si128(temporary, candidate_from_y), gap_open_plus_extension_vector),
                     );
-                    d = _mm_or_si128(d, _mm_and_si128(tmp, _mm_set1_epi8(0x10))); // d = b > 0? 1<<4 : 0
-                    tmp = _mm_cmpgt_epi8(a2, zero_);
+                    backtrack_byte_vector = _mm_or_si128(
+                        backtrack_byte_vector,
+                        _mm_and_si128(temporary, _mm_set1_epi8(INSERTION_CONTINUATION)),
+                    ); // the F state continues while candidate_from_y > 0
+                    temporary = _mm_cmpgt_epi8(candidate_from_x2, zero_vector);
                     _mm_store_si128(
-                        x2.as_mut_ptr().add(t),
-                        _mm_sub_epi8(_mm_and_si128(tmp, a2), qe2_),
+                        x2.as_mut_ptr().add(block),
+                        _mm_sub_epi8(
+                            _mm_and_si128(temporary, candidate_from_x2),
+                            gap_open2_plus_extension2_vector,
+                        ),
                     );
-                    d = _mm_or_si128(d, _mm_and_si128(tmp, _mm_set1_epi8(0x20))); // d = a2 > 0? 1<<5 : 0
-                    tmp = _mm_cmpgt_epi8(b2, zero_);
+                    backtrack_byte_vector = _mm_or_si128(
+                        backtrack_byte_vector,
+                        _mm_and_si128(temporary, _mm_set1_epi8(INTRON_CONTINUATION)),
+                    ); // the E2 state continues while candidate_from_x2 > 0
+                    temporary = _mm_cmpgt_epi8(candidate_from_y2, zero_vector);
                     _mm_store_si128(
-                        y2.as_mut_ptr().add(t),
-                        _mm_sub_epi8(_mm_and_si128(tmp, b2), qe2_),
+                        y2.as_mut_ptr().add(block),
+                        _mm_sub_epi8(
+                            _mm_and_si128(temporary, candidate_from_y2),
+                            gap_open2_plus_extension2_vector,
+                        ),
                     );
-                    d = _mm_or_si128(d, _mm_and_si128(tmp, _mm_set1_epi8(0x40))); // d = b2 > 0? 1<<6 : 0
-                    _mm_storeu_si128(p.as_mut_ptr().add(pr_off + t * 16) as *mut __m128i, d);
-                    t += 1;
+                    backtrack_byte_vector = _mm_or_si128(
+                        backtrack_byte_vector,
+                        _mm_and_si128(temporary, _mm_set1_epi8(SECOND_INSERTION_CONTINUATION)),
+                    ); // the F2 state continues while candidate_from_y2 > 0
+                    _mm_storeu_si128(
+                        backtrack_matrix
+                            .as_mut_ptr()
+                            .add(backtrack_row_offset + block * 16) as *mut __m128i,
+                        backtrack_byte_vector,
+                    );
+                    block += 1;
                 }
             } else {
                 // gap right-alignment
-                let pr_off = r as usize * n_col_ * 16 - st as usize;
-                off[r as usize] = st;
-                off_end[r as usize] = en;
-                let mut t = st_;
-                while t <= en_ {
-                    let mut z = _mm_load_si128(s.as_ptr().add(t));
-                    let mut xt1 = _mm_load_si128(x.as_ptr().add(t));
-                    let mut tmp = _mm_srli_si128::<15>(xt1);
-                    xt1 = _mm_or_si128(_mm_slli_si128::<1>(xt1), x1_);
-                    x1_ = tmp;
-                    let mut vt1 = _mm_load_si128(v.as_ptr().add(t));
-                    tmp = _mm_srli_si128::<15>(vt1);
-                    vt1 = _mm_or_si128(_mm_slli_si128::<1>(vt1), v1_);
-                    v1_ = tmp;
-                    let mut a = _mm_add_epi8(xt1, vt1);
-                    let ut = _mm_load_si128(u.as_ptr().add(t));
-                    let mut b = _mm_add_epi8(_mm_load_si128(y.as_ptr().add(t)), ut);
-                    let mut x2t1 = _mm_load_si128(x2.as_ptr().add(t));
-                    tmp = _mm_srli_si128::<15>(x2t1);
-                    x2t1 = _mm_or_si128(_mm_slli_si128::<1>(x2t1), x21_);
-                    x21_ = tmp;
-                    let mut a2 = _mm_add_epi8(x2t1, vt1);
-                    let mut b2 = _mm_add_epi8(_mm_load_si128(y2.as_ptr().add(t)), ut);
+                let backtrack_row_offset =
+                    anti_diagonal as usize * backtrack_blocks * 16 - band_start as usize;
+                band_start_per_row[anti_diagonal as usize] = band_start;
+                band_end_per_row[anti_diagonal as usize] = band_end;
+                let mut block = block_start;
+                while block <= block_end {
+                    let mut max_score_vector = _mm_load_si128(s.as_ptr().add(block));
+                    let mut x_previous_block = _mm_load_si128(x.as_ptr().add(block));
+                    let mut temporary = _mm_srli_si128::<15>(x_previous_block);
+                    x_previous_block =
+                        _mm_or_si128(_mm_slli_si128::<1>(x_previous_block), previous_x_vector);
+                    previous_x_vector = temporary;
+                    let mut v_previous_block = _mm_load_si128(v.as_ptr().add(block));
+                    temporary = _mm_srli_si128::<15>(v_previous_block);
+                    v_previous_block =
+                        _mm_or_si128(_mm_slli_si128::<1>(v_previous_block), previous_v_vector);
+                    previous_v_vector = temporary;
+                    let mut candidate_from_x = _mm_add_epi8(x_previous_block, v_previous_block);
+                    let u_current_block = _mm_load_si128(u.as_ptr().add(block));
+                    let mut candidate_from_y =
+                        _mm_add_epi8(_mm_load_si128(y.as_ptr().add(block)), u_current_block);
+                    let mut x2_previous_block = _mm_load_si128(x2.as_ptr().add(block));
+                    temporary = _mm_srli_si128::<15>(x2_previous_block);
+                    x2_previous_block =
+                        _mm_or_si128(_mm_slli_si128::<1>(x2_previous_block), previous_x2_vector);
+                    previous_x2_vector = temporary;
+                    let mut candidate_from_x2 = _mm_add_epi8(x2_previous_block, v_previous_block);
+                    let mut candidate_from_y2 =
+                        _mm_add_epi8(_mm_load_si128(y2.as_ptr().add(block)), u_current_block);
 
-                    let mut d = _mm_andnot_si128(_mm_cmpgt_epi8(z, a), _mm_set1_epi8(1)); // d = z > a?  0 : 1
-                    z = _mm_max_epi8(z, a);
-                    d = _mm_blendv_epi8(_mm_set1_epi8(2), d, _mm_cmpgt_epi8(z, b)); // d = z > b?  d : 2
-                    z = _mm_max_epi8(z, b);
-                    d = _mm_blendv_epi8(_mm_set1_epi8(3), d, _mm_cmpgt_epi8(z, a2)); // d = z > a2? d : 3
-                    z = _mm_max_epi8(z, a2);
-                    d = _mm_blendv_epi8(_mm_set1_epi8(4), d, _mm_cmpgt_epi8(z, b2)); // d = z > b2? d : 4
-                    z = _mm_max_epi8(z, b2);
-                    z = _mm_min_epi8(z, sc_mch_);
-                    // save u[] and v[]; update a, b, a2 and b2
-                    _mm_store_si128(u.as_mut_ptr().add(t), _mm_sub_epi8(z, vt1));
-                    _mm_store_si128(v.as_mut_ptr().add(t), _mm_sub_epi8(z, ut));
-                    tmp = _mm_sub_epi8(z, q_);
-                    a = _mm_sub_epi8(a, tmp);
-                    b = _mm_sub_epi8(b, tmp);
-                    tmp = _mm_sub_epi8(z, q2_);
-                    a2 = _mm_sub_epi8(a2, tmp);
-                    b2 = _mm_sub_epi8(b2, tmp);
+                    // 1 when candidate_from_x <= z
+                    let mut backtrack_byte_vector = _mm_andnot_si128(
+                        _mm_cmpgt_epi8(max_score_vector, candidate_from_x),
+                        _mm_set1_epi8(DELETION_STATE),
+                    );
+                    max_score_vector = _mm_max_epi8(max_score_vector, candidate_from_x);
+                    backtrack_byte_vector = _mm_blendv_epi8(
+                        _mm_set1_epi8(INSERTION_STATE),
+                        backtrack_byte_vector,
+                        _mm_cmpgt_epi8(max_score_vector, candidate_from_y),
+                    ); // 2 unless candidate_from_y > z
+                    max_score_vector = _mm_max_epi8(max_score_vector, candidate_from_y);
+                    backtrack_byte_vector = _mm_blendv_epi8(
+                        _mm_set1_epi8(INTRON_STATE),
+                        backtrack_byte_vector,
+                        _mm_cmpgt_epi8(max_score_vector, candidate_from_x2),
+                    ); // 3 unless candidate_from_x2 > z
+                    max_score_vector = _mm_max_epi8(max_score_vector, candidate_from_x2);
+                    backtrack_byte_vector = _mm_blendv_epi8(
+                        _mm_set1_epi8(SECOND_INSERTION_STATE),
+                        backtrack_byte_vector,
+                        _mm_cmpgt_epi8(max_score_vector, candidate_from_y2),
+                    ); // 4 unless candidate_from_y2 > z
+                    max_score_vector = _mm_max_epi8(max_score_vector, candidate_from_y2);
+                    max_score_vector = _mm_min_epi8(max_score_vector, match_score_vector);
+                    // save u[] and v[]; update the candidates
+                    _mm_store_si128(
+                        u.as_mut_ptr().add(block),
+                        _mm_sub_epi8(max_score_vector, v_previous_block),
+                    );
+                    _mm_store_si128(
+                        v.as_mut_ptr().add(block),
+                        _mm_sub_epi8(max_score_vector, u_current_block),
+                    );
+                    temporary = _mm_sub_epi8(max_score_vector, gap_open_vector);
+                    candidate_from_x = _mm_sub_epi8(candidate_from_x, temporary);
+                    candidate_from_y = _mm_sub_epi8(candidate_from_y, temporary);
+                    temporary = _mm_sub_epi8(max_score_vector, gap_open2_vector);
+                    candidate_from_x2 = _mm_sub_epi8(candidate_from_x2, temporary);
+                    candidate_from_y2 = _mm_sub_epi8(candidate_from_y2, temporary);
 
-                    tmp = _mm_cmpgt_epi8(zero_, a);
+                    temporary = _mm_cmpgt_epi8(zero_vector, candidate_from_x);
                     _mm_store_si128(
-                        x.as_mut_ptr().add(t),
-                        _mm_sub_epi8(_mm_andnot_si128(tmp, a), qe_),
+                        x.as_mut_ptr().add(block),
+                        _mm_sub_epi8(_mm_andnot_si128(temporary, candidate_from_x), gap_open_plus_extension_vector),
                     );
-                    d = _mm_or_si128(d, _mm_andnot_si128(tmp, _mm_set1_epi8(0x08))); // d = a > 0? 1<<3 : 0
-                    tmp = _mm_cmpgt_epi8(zero_, b);
+                    backtrack_byte_vector = _mm_or_si128(
+                        backtrack_byte_vector,
+                        _mm_andnot_si128(temporary, _mm_set1_epi8(DELETION_CONTINUATION)),
+                    ); // the E state continues while candidate_from_x > 0
+                    temporary = _mm_cmpgt_epi8(zero_vector, candidate_from_y);
                     _mm_store_si128(
-                        y.as_mut_ptr().add(t),
-                        _mm_sub_epi8(_mm_andnot_si128(tmp, b), qe_),
+                        y.as_mut_ptr().add(block),
+                        _mm_sub_epi8(_mm_andnot_si128(temporary, candidate_from_y), gap_open_plus_extension_vector),
                     );
-                    d = _mm_or_si128(d, _mm_andnot_si128(tmp, _mm_set1_epi8(0x10))); // d = b > 0? 1<<4 : 0
-                    tmp = _mm_cmpgt_epi8(zero_, a2);
+                    backtrack_byte_vector = _mm_or_si128(
+                        backtrack_byte_vector,
+                        _mm_andnot_si128(temporary, _mm_set1_epi8(INSERTION_CONTINUATION)),
+                    ); // the F state continues while candidate_from_y > 0
+                    temporary = _mm_cmpgt_epi8(zero_vector, candidate_from_x2);
                     _mm_store_si128(
-                        x2.as_mut_ptr().add(t),
-                        _mm_sub_epi8(_mm_andnot_si128(tmp, a2), qe2_),
+                        x2.as_mut_ptr().add(block),
+                        _mm_sub_epi8(
+                            _mm_andnot_si128(temporary, candidate_from_x2),
+                            gap_open2_plus_extension2_vector,
+                        ),
                     );
-                    d = _mm_or_si128(d, _mm_andnot_si128(tmp, _mm_set1_epi8(0x20))); // d = a2 > 0? 1<<5 : 0
-                    tmp = _mm_cmpgt_epi8(zero_, b2);
+                    backtrack_byte_vector = _mm_or_si128(
+                        backtrack_byte_vector,
+                        _mm_andnot_si128(temporary, _mm_set1_epi8(INTRON_CONTINUATION)),
+                    ); // the E2 state continues while candidate_from_x2 > 0
+                    temporary = _mm_cmpgt_epi8(zero_vector, candidate_from_y2);
                     _mm_store_si128(
-                        y2.as_mut_ptr().add(t),
-                        _mm_sub_epi8(_mm_andnot_si128(tmp, b2), qe2_),
+                        y2.as_mut_ptr().add(block),
+                        _mm_sub_epi8(
+                            _mm_andnot_si128(temporary, candidate_from_y2),
+                            gap_open2_plus_extension2_vector,
+                        ),
                     );
-                    d = _mm_or_si128(d, _mm_andnot_si128(tmp, _mm_set1_epi8(0x40))); // d = b2 > 0? 1<<6 : 0
-                    _mm_storeu_si128(p.as_mut_ptr().add(pr_off + t * 16) as *mut __m128i, d);
-                    t += 1;
+                    backtrack_byte_vector = _mm_or_si128(
+                        backtrack_byte_vector,
+                        _mm_andnot_si128(temporary, _mm_set1_epi8(SECOND_INSERTION_CONTINUATION)),
+                    ); // the F2 state continues while candidate_from_y2 > 0
+                    _mm_storeu_si128(
+                        backtrack_matrix
+                            .as_mut_ptr()
+                            .add(backtrack_row_offset + block * 16) as *mut __m128i,
+                        backtrack_byte_vector,
+                    );
+                    block += 1;
                 }
             }
 
-            if !approx_max {
+            if !approximate_max {
                 // find the exact max with a 32-bit score array
-                let max_h: i32;
-                let max_t: i32;
-                if r > 0 {
-                    let en0u = en0 as usize;
-                    let mut mh = if en0 > 0 {
-                        h[en0u - 1] + *up.add(en0u) as i32
+                let exact_max_score: i32;
+                let exact_max_score_target_index: i32;
+                if anti_diagonal > 0 {
+                    let unpadded_band_end_usize = unpadded_band_end as usize;
+                    let mut max_score = if unpadded_band_end > 0 {
+                        score_table[unpadded_band_end_usize - 1] + *u_ptr.add(unpadded_band_end_usize) as i32
                     } else {
-                        h[en0u] + *vp.add(en0u) as i32
+                        score_table[unpadded_band_end_usize] + *v_ptr.add(unpadded_band_end_usize) as i32
                     };
-                    h[en0u] = mh; // special casing the last element
-                    let mut mt = en0;
-                    let mut max_h_ = _mm_set1_epi32(mh);
-                    let mut max_t_ = _mm_set1_epi32(mt);
-                    let en1 = st0 + (en0 - st0) / 4 * 4;
-                    let mut t = st0;
-                    while t < en1 {
-                        let tu = t as usize;
-                        let mut h1_ = _mm_loadu_si128(h.as_ptr().add(tu) as *const __m128i);
-                        let tv = _mm_setr_epi32(
-                            *vp.add(tu) as i32,
-                            *vp.add(tu + 1) as i32,
-                            *vp.add(tu + 2) as i32,
-                            *vp.add(tu + 3) as i32,
+                    score_table[unpadded_band_end_usize] = max_score; // special casing the last element
+                    let mut max_score_target_index = unpadded_band_end;
+                    let mut max_score_vector = _mm_set1_epi32(max_score);
+                    let mut max_score_target_index_vector = _mm_set1_epi32(max_score_target_index);
+                    let vectorized_end = unpadded_band_start + (unpadded_band_end - unpadded_band_start) / 4 * 4;
+                    let mut target_index = unpadded_band_start;
+                    while target_index < vectorized_end {
+                        let target_index_usize = target_index as usize;
+                        let mut score_block =
+                            _mm_loadu_si128(score_table.as_ptr().add(target_index_usize) as *const __m128i);
+                        let v_scores = _mm_setr_epi32(
+                            *v_ptr.add(target_index_usize) as i32,
+                            *v_ptr.add(target_index_usize + 1) as i32,
+                            *v_ptr.add(target_index_usize + 2) as i32,
+                            *v_ptr.add(target_index_usize + 3) as i32,
                         );
-                        h1_ = _mm_add_epi32(h1_, tv);
-                        _mm_storeu_si128(h.as_mut_ptr().add(tu) as *mut __m128i, h1_);
-                        let tt = _mm_set1_epi32(t);
-                        let tmp = _mm_cmpgt_epi32(h1_, max_h_);
-                        max_h_ = _mm_blendv_epi8(max_h_, h1_, tmp);
-                        max_t_ = _mm_blendv_epi8(max_t_, tt, tmp);
-                        t += 4;
+                        score_block = _mm_add_epi32(score_block, v_scores);
+                        _mm_storeu_si128(
+                            score_table.as_mut_ptr().add(target_index_usize) as *mut __m128i,
+                            score_block,
+                        );
+                        let target_index_vector = _mm_set1_epi32(target_index);
+                        let temporary = _mm_cmpgt_epi32(score_block, max_score_vector);
+                        max_score_vector = _mm_blendv_epi8(max_score_vector, score_block, temporary);
+                        max_score_target_index_vector =
+                            _mm_blendv_epi8(max_score_target_index_vector, target_index_vector, temporary);
+                        target_index += 4;
                     }
-                    let mut hh = [0i32; 4];
-                    let mut tt = [0i32; 4];
-                    _mm_storeu_si128(hh.as_mut_ptr() as *mut __m128i, max_h_);
-                    _mm_storeu_si128(tt.as_mut_ptr() as *mut __m128i, max_t_);
-                    for i in 0..4 {
-                        if mh < hh[i] {
-                            mh = hh[i];
-                            mt = tt[i] + i as i32;
+                    let mut lane_scores = [0i32; 4];
+                    let mut lane_indices = [0i32; 4];
+                    _mm_storeu_si128(lane_scores.as_mut_ptr() as *mut __m128i, max_score_vector);
+                    _mm_storeu_si128(
+                        lane_indices.as_mut_ptr() as *mut __m128i,
+                        max_score_target_index_vector,
+                    );
+                    for lane in 0..4 {
+                        if max_score < lane_scores[lane] {
+                            max_score = lane_scores[lane];
+                            max_score_target_index = lane_indices[lane] + lane as i32;
                         }
                     }
-                    while t < en0 {
-                        let tu = t as usize;
-                        h[tu] += *vp.add(tu) as i32;
-                        if h[tu] > mh {
-                            mh = h[tu];
-                            mt = t;
+                    while target_index < unpadded_band_end {
+                        let target_index_usize = target_index as usize;
+                        score_table[target_index_usize] += *v_ptr.add(target_index_usize) as i32;
+                        if score_table[target_index_usize] > max_score {
+                            max_score = score_table[target_index_usize];
+                            max_score_target_index = target_index;
                         }
-                        t += 1;
+                        target_index += 1;
                     }
-                    max_h = mh;
-                    max_t = mt;
+                    exact_max_score = max_score;
+                    exact_max_score_target_index = max_score_target_index;
                 } else {
                     // C: H[0] = v8[0] - qe, with the pre-swap qe
-                    h[0] = *vp as i32 - qe_pre_swap;
-                    max_h = h[0];
-                    max_t = 0;
+                    score_table[0] = *v_ptr as i32 - gap_open_plus_extension_before_swap;
+                    exact_max_score = score_table[0];
+                    exact_max_score_target_index = 0;
                 }
-                // update ez
-                if en0 == tlen - 1 && h[en0 as usize] > ez.mte {
-                    ez.mte = h[en0 as usize];
-                    ez.mte_q = r - en;
+                // update the result
+                if unpadded_band_end == target_len - 1 && score_table[unpadded_band_end as usize] > result.mte {
+                    result.mte = score_table[unpadded_band_end as usize];
+                    result.mte_q = anti_diagonal - band_end;
                 }
-                if r - st0 == qlen - 1 && h[st0 as usize] > ez.mqe {
-                    ez.mqe = h[st0 as usize];
-                    ez.mqe_t = st0;
+                if anti_diagonal - unpadded_band_start == query_len - 1
+                    && score_table[unpadded_band_start as usize] > result.mqe
+                {
+                    result.mqe = score_table[unpadded_band_start as usize];
+                    result.mqe_t = unpadded_band_start;
                 }
-                if apply_zdrop(ez, true, max_h, r, max_t, zdrop, e2) {
+                if apply_z_drop(
+                    result,
+                    true,
+                    exact_max_score,
+                    anti_diagonal,
+                    exact_max_score_target_index,
+                    z_drop,
+                    gap_extension2,
+                ) {
                     break;
                 }
-                if r == qlen + tlen - 2 && en0 == tlen - 1 {
-                    ez.score = h[tlen_u - 1];
+                if anti_diagonal == query_len + target_len - 2 && unpadded_band_end == target_len - 1 {
+                    result.score = score_table[target_len_usize - 1];
                 }
             } else {
                 // find approximate max; Z-drop might be inaccurate, too.
-                if r > 0 {
-                    if last_h0_t >= st0
-                        && last_h0_t <= en0
-                        && last_h0_t + 1 >= st0
-                        && last_h0_t + 1 <= en0
+                if anti_diagonal > 0 {
+                    if diagonal_score_target_index >= unpadded_band_start
+                        && diagonal_score_target_index <= unpadded_band_end
+                        && diagonal_score_target_index + 1 >= unpadded_band_start
+                        && diagonal_score_target_index + 1 <= unpadded_band_end
                     {
-                        let d0 = *vp.add(last_h0_t as usize) as i32;
-                        let d1 = *up.add(last_h0_t as usize + 1) as i32;
-                        if d0 > d1 {
-                            h0 += d0;
+                        let score_from_v = *v_ptr.add(diagonal_score_target_index as usize) as i32;
+                        let score_from_u = *u_ptr.add(diagonal_score_target_index as usize + 1) as i32;
+                        if score_from_v > score_from_u {
+                            diagonal_score += score_from_v;
                         } else {
-                            h0 += d1;
-                            last_h0_t += 1;
+                            diagonal_score += score_from_u;
+                            diagonal_score_target_index += 1;
                         }
-                    } else if last_h0_t >= st0 && last_h0_t <= en0 {
-                        h0 += *vp.add(last_h0_t as usize) as i32;
+                    } else if diagonal_score_target_index >= unpadded_band_start
+                        && diagonal_score_target_index <= unpadded_band_end
+                    {
+                        diagonal_score += *v_ptr.add(diagonal_score_target_index as usize) as i32;
                     } else {
-                        last_h0_t += 1;
-                        h0 += *up.add(last_h0_t as usize) as i32;
+                        diagonal_score_target_index += 1;
+                        diagonal_score += *u_ptr.add(diagonal_score_target_index as usize) as i32;
                     }
                 } else {
                     // C: H0 = v8[0] - qe, with the pre-swap qe
-                    h0 = *vp as i32 - qe_pre_swap;
-                    last_h0_t = 0;
+                    diagonal_score = *v_ptr as i32 - gap_open_plus_extension_before_swap;
+                    diagonal_score_target_index = 0;
                 }
                 // note: unlike extz2, the C code calls ksw_apply_zdrop() outside
-                // the "if (r > 0)" block here
-                if (flag & KSW_EZ_APPROX_DROP) != 0
-                    && apply_zdrop(ez, true, h0, r, last_h0_t, zdrop, e2)
+                // the "if (anti_diagonal > 0)" block here
+                if (flags & KSW_EZ_APPROX_DROP) != 0
+                    && apply_z_drop(
+                        result,
+                        true,
+                        diagonal_score,
+                        anti_diagonal,
+                        diagonal_score_target_index,
+                        z_drop,
+                        gap_extension2,
+                    )
                 {
                     break;
                 }
-                if r == qlen + tlen - 2 && en0 == tlen - 1 {
-                    ez.score = h0;
+                if anti_diagonal == query_len + target_len - 2 && unpadded_band_end == target_len - 1 {
+                    result.score = diagonal_score;
                 }
             }
-            last_st = st;
-            last_en = en;
+            previous_band_start = band_start;
+            previous_band_end = band_end;
         }
 
-        if with_cigar {
-            let rev_cigar = (flag & KSW_EZ_REV_CIGAR) != 0;
-            let p_bytes = &p[..n_rows * n_col_ * 16];
-            let nc = n_col_ as i32 * 16;
-            if !ez.zdropped && (flag & KSW_EZ_EXTZ_ONLY) == 0 {
+        if record_cigar {
+            let reverse_cigar = (flags & KSW_EZ_REV_CIGAR) != 0;
+            let backtrack_bytes = &backtrack_matrix[..row_count * backtrack_blocks * 16];
+            let backtrack_row_bytes = backtrack_blocks as i32 * 16;
+            if !result.zdropped && (flags & KSW_EZ_EXTZ_ONLY) == 0 {
                 backtrack(
                     true,
-                    rev_cigar,
+                    reverse_cigar,
                     0,
-                    p_bytes,
-                    &off,
-                    Some(&off_end),
-                    nc,
-                    tlen - 1,
-                    qlen - 1,
-                    &mut ez.cigar,
+                    backtrack_bytes,
+                    &band_start_per_row,
+                    Some(&band_end_per_row),
+                    backtrack_row_bytes,
+                    target_len - 1,
+                    query_len - 1,
+                    &mut result.cigar,
                 );
-            } else if !ez.zdropped
-                && (flag & KSW_EZ_EXTZ_ONLY) != 0
-                && ez.mqe + end_bonus > ez.max as i32
+            } else if !result.zdropped
+                && (flags & KSW_EZ_EXTZ_ONLY) != 0
+                && result.mqe + end_bonus > result.max as i32
             {
-                ez.reach_end = 1;
+                result.reach_end = 1;
                 backtrack(
                     true,
-                    rev_cigar,
+                    reverse_cigar,
                     0,
-                    p_bytes,
-                    &off,
-                    Some(&off_end),
-                    nc,
-                    ez.mqe_t,
-                    qlen - 1,
-                    &mut ez.cigar,
+                    backtrack_bytes,
+                    &band_start_per_row,
+                    Some(&band_end_per_row),
+                    backtrack_row_bytes,
+                    result.mqe_t,
+                    query_len - 1,
+                    &mut result.cigar,
                 );
-            } else if ez.max_t >= 0 && ez.max_q >= 0 {
+            } else if result.max_t >= 0 && result.max_q >= 0 {
                 backtrack(
                     true,
-                    rev_cigar,
+                    reverse_cigar,
                     0,
-                    p_bytes,
-                    &off,
-                    Some(&off_end),
-                    nc,
-                    ez.max_t,
-                    ez.max_q,
-                    &mut ez.cigar,
+                    backtrack_bytes,
+                    &band_start_per_row,
+                    Some(&band_end_per_row),
+                    backtrack_row_bytes,
+                    result.max_t,
+                    result.max_q,
+                    &mut result.cigar,
                 );
             }
-            if (flag & KSW_EZ_EQX) != 0 {
-                let ci0 = ez.cigar.clone();
-                cigar2eqx(query, target, &ci0, &mut ez.cigar);
+            if (flags & KSW_EZ_EQX) != 0 {
+                let input_cigar = result.cigar.clone();
+                expand_cigar_matches(query, target, &input_cigar, &mut result.cigar);
             }
         }
     }

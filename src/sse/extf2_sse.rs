@@ -3,159 +3,193 @@
 
 use core::arch::x86_64::*;
 
-use crate::common::reset_extz;
+use crate::common::reset_extension_result;
 use crate::KswExtz;
 
 #[target_feature(enable = "sse4.1")]
 pub(crate) unsafe fn ksw_extf2_sse(
-    qlen: i32,
+    query_len: i32,
     query: &[u8],
-    tlen: i32,
+    target_len: i32,
     target: &[u8],
-    mch: i8,
-    mis: i8,
-    e: i8,
-    w: i32,
-    xdrop: i32,
-    ez: &mut KswExtz,
+    match_score: i8,
+    mismatch_score: i8,
+    gap_extension: i8,
+    band_width: i32,
+    x_drop: i32,
+    result: &mut KswExtz,
 ) {
     unsafe {
-        reset_extz(ez);
-        if qlen <= 0 || tlen <= 0 {
+        reset_extension_result(result);
+        if query_len <= 0 || target_len <= 0 {
             return;
         }
-        let qlen_u = qlen as usize;
-        let tlen_u = tlen as usize;
-        let e_i = e as i32;
+        let query_len_usize = query_len as usize;
+        let target_len_usize = target_len as usize;
+        let gap_extension_i32 = gap_extension as i32;
 
-        let e2_ = _mm_set1_epi8((e_i * 2) as i8);
-        let sc_mch_ = _mm_set1_epi8(mch);
-        let sc_mis_ = _mm_set1_epi8(if mis < 0 { mis } else { -mis });
-        let tlen_ = ((tlen + 15) / 16) as usize;
-        let qlen_ = ((qlen + 15) / 16) as usize;
-        let w = if w < 0 { if tlen > qlen { tlen } else { qlen } } else { w };
+        let twice_gap_extension_vector = _mm_set1_epi8((gap_extension_i32 * 2) as i8);
+        let match_score_vector = _mm_set1_epi8(match_score);
+        let mismatch_score_vector =
+            _mm_set1_epi8(if mismatch_score < 0 { mismatch_score } else { -mismatch_score });
+        let target_block_count = ((target_len + 15) / 16) as usize;
+        let query_block_count = ((query_len + 15) / 16) as usize;
+        let band_width = if band_width < 0 {
+            if target_len > query_len {
+                target_len
+            } else {
+                query_len
+            }
+        } else {
+            band_width
+        };
 
-        let zero_ = _mm_setzero_si128();
-        let mut u = vec![zero_; tlen_];
-        let mut v = vec![zero_; tlen_];
-        let mut s = vec![zero_; tlen_ + 1];
-        let mut sf = vec![0u8; tlen_ * 16 + 16];
-        let mut qr = vec![0u8; (qlen_ + 1) * 16];
+        let zero_vector = _mm_setzero_si128();
+        let mut u = vec![zero_vector; target_block_count];
+        let mut v = vec![zero_vector; target_block_count];
+        let mut s = vec![zero_vector; target_block_count + 1];
+        let mut padded_target = vec![0u8; target_block_count * 16 + 16];
+        let mut reverse_query = vec![0u8; (query_block_count + 1) * 16];
 
-        for t in 0..qlen_u {
-            qr[t] = query[qlen_u - 1 - t];
+        for query_index in 0..query_len_usize {
+            reverse_query[query_index] = query[query_len_usize - 1 - query_index];
         }
-        sf[..tlen_u].copy_from_slice(&target[..tlen_u]);
+        padded_target[..target_len_usize].copy_from_slice(&target[..target_len_usize]);
 
-        let up = u.as_mut_ptr() as *mut u8;
-        let vp = v.as_mut_ptr() as *mut u8;
+        let u_ptr = u.as_mut_ptr() as *mut u8;
+        let v_ptr = v.as_mut_ptr() as *mut u8;
 
-        let mut h0 = 0i32;
-        let mut last_h0_t = 0i32;
-        let mut last_st = -1i32;
-        let mut last_en = -1i32;
-        let mut r = 0i32;
-        while r < qlen + tlen - 1 {
-            let mut st = 0i32;
-            let mut en = tlen - 1;
+        let mut diagonal_score = 0i32;
+        let mut diagonal_score_target_index = 0i32;
+        let mut previous_band_start = -1i32;
+        let mut previous_band_end = -1i32;
+        let mut anti_diagonal = 0i32;
+        while anti_diagonal < query_len + target_len - 1 {
+            let mut band_start = 0i32;
+            let mut band_end = target_len - 1;
             // find the boundaries
-            if st < r - qlen + 1 {
-                st = r - qlen + 1;
+            if band_start < anti_diagonal - query_len + 1 {
+                band_start = anti_diagonal - query_len + 1;
             }
-            if en > r {
-                en = r;
+            if band_end > anti_diagonal {
+                band_end = anti_diagonal;
             }
-            if st < (r - w + 1) >> 1 {
-                st = (r - w + 1) >> 1; // take the ceil
+            if band_start < (anti_diagonal - band_width + 1) >> 1 {
+                band_start = (anti_diagonal - band_width + 1) >> 1; // take the ceil
             }
-            if en > (r + w) >> 1 {
-                en = (r + w) >> 1; // take the floor
+            if band_end > (anti_diagonal + band_width) >> 1 {
+                band_end = (anti_diagonal + band_width) >> 1; // take the floor
             }
-            if st > en {
+            if band_start > band_end {
                 break;
             }
-            let st0 = st;
-            let en0 = en;
-            st = st / 16 * 16;
-            en = (en + 16) / 16 * 16 - 1;
+            let unpadded_band_start = band_start;
+            let unpadded_band_end = band_end;
+            band_start = band_start / 16 * 16;
+            band_end = (band_end + 16) / 16 * 16 - 1;
             // set boundary conditions
-            let v1: u8 = if st > 0 && st - 1 >= last_st && st - 1 <= last_en {
-                *vp.add((st - 1) as usize)
+            let previous_v: u8 = if band_start > 0
+                && band_start - 1 >= previous_band_start
+                && band_start - 1 <= previous_band_end
+            {
+                *v_ptr.add((band_start - 1) as usize)
             } else {
                 0
             };
-            if en >= r {
-                *up.add(r as usize) = 0;
+            if band_end >= anti_diagonal {
+                *u_ptr.add(anti_diagonal as usize) = 0;
             }
             // core loop
-            let mut v1_ = _mm_cvtsi32_si128(v1 as i32);
-            let st_ = (st / 16) as usize;
-            let en_ = (en / 16) as usize;
-            let qrr_base = qlen_u as isize - 1 - r as isize;
-            let mut t = st0;
-            while t <= en0 {
-                let sq = _mm_loadu_si128(sf.as_ptr().add(t as usize) as *const __m128i);
-                let stq = _mm_loadu_si128(
-                    qr.as_ptr().offset(qrr_base + t as isize) as *const __m128i
+            let mut previous_v_vector = _mm_cvtsi32_si128(previous_v as i32);
+            let block_start = (band_start / 16) as usize;
+            let block_end = (band_end / 16) as usize;
+            let reverse_query_base = query_len_usize as isize - 1 - anti_diagonal as isize;
+            let mut target_index = unpadded_band_start;
+            while target_index <= unpadded_band_end {
+                let target_block =
+                    _mm_loadu_si128(padded_target.as_ptr().add(target_index as usize) as *const __m128i);
+                let query_block = _mm_loadu_si128(
+                    reverse_query.as_ptr().offset(reverse_query_base + target_index as isize)
+                        as *const __m128i,
                 );
-                let mut tmp = _mm_cmpeq_epi8(sq, stq);
-                tmp = _mm_blendv_epi8(sc_mis_, sc_mch_, tmp);
+                let mut score_block = _mm_cmpeq_epi8(target_block, query_block);
+                score_block = _mm_blendv_epi8(mismatch_score_vector, match_score_vector, score_block);
                 _mm_storeu_si128(
-                    (s.as_mut_ptr() as *mut u8).add(t as usize) as *mut __m128i,
-                    tmp,
+                    (s.as_mut_ptr() as *mut u8).add(target_index as usize) as *mut __m128i,
+                    score_block,
                 );
-                t += 16;
+                target_index += 16;
             }
-            let mut t = st_;
-            while t <= en_ {
-                let mut z = _mm_add_epi8(_mm_load_si128(s.as_ptr().add(t)), e2_);
-                let mut vt1 = _mm_load_si128(v.as_ptr().add(t)); // vt1 <- v[r-1][t..t+15]
-                let tmp = _mm_srli_si128::<15>(vt1); // tmp <- v[r-1][t+15]
-                vt1 = _mm_or_si128(_mm_slli_si128::<1>(vt1), v1_); // vt1 <- v[r-1][t-1..t+14]
-                v1_ = tmp;
-                let ut = _mm_load_si128(u.as_ptr().add(t)); // ut <- u[t..t+15]
-                z = _mm_max_epi8(z, vt1);
-                z = _mm_max_epu8(z, ut); // z = max(z, b); this works because both are non-negative
-                _mm_store_si128(u.as_mut_ptr().add(t), _mm_sub_epi8(z, vt1)); // u[r][t..t+15] <- z - v[r-1][t-1..t+14]
-                _mm_store_si128(v.as_mut_ptr().add(t), _mm_sub_epi8(z, ut)); // v[r][t..t+15] <- z - u[r-1][t..t+15]
-                t += 1;
+            let mut block = block_start;
+            while block <= block_end {
+                let mut max_score_vector =
+                    _mm_add_epi8(_mm_load_si128(s.as_ptr().add(block)), twice_gap_extension_vector);
+                // v_previous_block <- v[r-1][t-1..t+14]
+                let mut v_previous_block = _mm_load_si128(v.as_ptr().add(block));
+                let temporary = _mm_srli_si128::<15>(v_previous_block); // v[r-1][t+15]
+                v_previous_block =
+                    _mm_or_si128(_mm_slli_si128::<1>(v_previous_block), previous_v_vector);
+                previous_v_vector = temporary;
+                let u_current_block = _mm_load_si128(u.as_ptr().add(block));
+                max_score_vector = _mm_max_epi8(max_score_vector, v_previous_block);
+                // this works because both are non-negative
+                max_score_vector = _mm_max_epu8(max_score_vector, u_current_block);
+                // u[r][t..t+15] <- z - v[r-1][t-1..t+14]
+                _mm_store_si128(
+                    u.as_mut_ptr().add(block),
+                    _mm_sub_epi8(max_score_vector, v_previous_block),
+                );
+                // v[r][t..t+15] <- z - u[r-1][t..t+15]
+                _mm_store_si128(
+                    v.as_mut_ptr().add(block),
+                    _mm_sub_epi8(max_score_vector, u_current_block),
+                );
+                block += 1;
             }
-            if r > 0 {
-                if last_h0_t >= st0 && last_h0_t <= en0 && last_h0_t + 1 >= st0 && last_h0_t + 1 <= en0
+            if anti_diagonal > 0 {
+                if diagonal_score_target_index >= unpadded_band_start
+                    && diagonal_score_target_index <= unpadded_band_end
+                    && diagonal_score_target_index + 1 >= unpadded_band_start
+                    && diagonal_score_target_index + 1 <= unpadded_band_end
                 {
-                    let d0 = *vp.add(last_h0_t as usize) as i32 - e_i;
-                    let d1 = *up.add(last_h0_t as usize + 1) as i32 - e_i;
-                    if d0 > d1 {
-                        h0 += d0;
+                    let score_from_v = *v_ptr.add(diagonal_score_target_index as usize) as i32 - gap_extension_i32;
+                    let score_from_u =
+                        *u_ptr.add(diagonal_score_target_index as usize + 1) as i32 - gap_extension_i32;
+                    if score_from_v > score_from_u {
+                        diagonal_score += score_from_v;
                     } else {
-                        h0 += d1;
-                        last_h0_t += 1;
+                        diagonal_score += score_from_u;
+                        diagonal_score_target_index += 1;
                     }
-                } else if last_h0_t >= st0 && last_h0_t <= en0 {
-                    h0 += *vp.add(last_h0_t as usize) as i32 - e_i;
+                } else if diagonal_score_target_index >= unpadded_band_start
+                    && diagonal_score_target_index <= unpadded_band_end
+                {
+                    diagonal_score +=
+                        *v_ptr.add(diagonal_score_target_index as usize) as i32 - gap_extension_i32;
                 } else {
-                    last_h0_t += 1;
-                    h0 += *up.add(last_h0_t as usize) as i32 - e_i;
+                    diagonal_score_target_index += 1;
+                    diagonal_score +=
+                        *u_ptr.add(diagonal_score_target_index as usize) as i32 - gap_extension_i32;
                 }
-                if h0 > ez.max as i32 {
-                    ez.max = (h0 as u32) & 0x7fff_ffff;
-                    ez.max_t = last_h0_t;
-                    ez.max_q = r - last_h0_t;
-                } else if xdrop >= 0 && ez.max as i32 - h0 > xdrop {
+                if diagonal_score > result.max as i32 {
+                    result.max = (diagonal_score as u32) & 0x7fff_ffff;
+                    result.max_t = diagonal_score_target_index;
+                    result.max_q = anti_diagonal - diagonal_score_target_index;
+                } else if x_drop >= 0 && result.max as i32 - diagonal_score > x_drop {
                     break;
                 }
             } else {
-                h0 = *vp as i32 - e_i - e_i;
-                last_h0_t = 0;
+                diagonal_score = *v_ptr as i32 - gap_extension_i32 - gap_extension_i32;
+                diagonal_score_target_index = 0;
             }
-            last_st = st;
-            last_en = en;
-            r += 1;
+            previous_band_start = band_start;
+            previous_band_end = band_end;
+            anti_diagonal += 1;
         }
-        if r == qlen + tlen - 1 {
-            ez.score = h0;
+        if anti_diagonal == query_len + target_len - 1 {
+            result.score = diagonal_score;
         } else {
-            ez.zdropped = true;
+            result.zdropped = true;
         }
     }
 }

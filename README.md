@@ -46,21 +46,21 @@ oracle（`scripts/gen_expected.sh` 用 C 版本生成期望输出）。
 use rsksw2::*;
 
 // 5x5 打分矩阵：match +2、mismatch -4、wildcard 行/列为 0
-let mat: [i8; 25] = [ 2, -4, -4, -4, 0,
-                     -4,  2, -4, -4, 0,
-                     -4, -4,  2, -4, 0,
-                     -4, -4, -4,  2, 0,
-                      0,  0,  0,  0, 0];
+let score_matrix: [i8; 25] = [ 2, -4, -4, -4, 0,
+                             -4,  2, -4, -4, 0,
+                             -4, -4,  2, -4, 0,
+                             -4, -4, -4,  2, 0,
+                              0,  0,  0,  0, 0];
 let query:  &[u8] = &[0, 1, 2, 3];   // A C G T
 let target: &[u8] = &[0, 1, 2, 3];
 
-let mut ez = KswExtz::new();                     // 可跨调用复用，内部 CIGAR 缓冲会被重复利用
-ksw_extz2_sse(4, query, 4, target, 5, &mat,
-              4, 2,        // q, e
-              -1, -1,      // w = inf, zdrop = disabled
-              0, 0,        // end_bonus, flag
-              &mut ez);
-println!("score = {}, cigar = {}", ez.score, ez.cigar_string());
+let mut result = KswExtz::new();                 // 可跨调用复用，内部 CIGAR 缓冲会被重复利用
+ksw_extz2_sse(4, query, 4, target, 5, &score_matrix,
+              4, 2,        // gap_open, gap_extension
+              -1, -1,      // band_width = inf, z_drop = disabled
+              0, 0,        // end_bonus, flags
+              &mut result);
+println!("score = {}, cigar = {}", result.score, result.cigar_string());
 ```
 
 ### 函数签名对照
