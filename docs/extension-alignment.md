@@ -71,7 +71,64 @@ max − H > zdrop + l·e
 长 insertion 本来就要花 `l·e` 的罚分，不应该被误判为「同源区结束」。这是 Z-drop 比朴素
 X-drop（`extf2_sse` 用的那种，纯分数差阈值）更精细的地方。
 
-## 4. 函数命名对照
+## 4. 双向延伸：从锚点向两侧延伸
+
+单次调用只能沿一个方向延伸：DP 原点固定在 (0,0)，只向索引增大的方向填表
+（[`src/extz.rs`](../src/extz.rs#L97)），没有「负坐标」的概念。向锚点两侧延伸是**两次调用
+拼出来的**——KSW2 的 `Flags::REV_CIGAR` 就是为这个工作流准备的
+（[`src/lib.rs`](../src/lib.rs#L178)）。
+
+设 0-based 坐标，种子（锚点）落在 `target[200..200+k]` ↔ `query[100..100+k]`：
+
+```
+target:  [0 ......... 199][种子 200..200+k][... 到尾]
+query:   [0 ..... 99][种子 100..100+k][... 到尾]
+          ←── 左延伸（翻转后调用）         右延伸 ──→
+```
+
+**向右（朝尾部）**：后缀直接调用，此次调用的 (0,0) 就是锚点。
+
+```rust
+extz2_sse(&query[100 + k..], &target[200 + k..], &scoring,
+          band, z_drop, 0, Flags::EXTZ_ONLY, &mut right);
+```
+
+**向左（朝头部）**：把锚点之前的**前缀做反向互补**，在翻转坐标系里同样「向右」延伸；
+`REV_CIGAR` 让输出的 CIGAR 反序，直接拼回正向。
+
+```rust
+let q_flip = revcomp(&query[..100]);   // revcomp 由调用方提供
+let t_flip = revcomp(&target[..200]);
+extz2_sse(&q_flip, &t_flip, &scoring,
+          band, z_drop, 0,
+          Flags::EXTZ_ONLY | Flags::REV_CIGAR, &mut left);
+```
+
+最终 CIGAR = 左 CIGAR + 种子 `kM` + 右 CIGAR（相邻同类操作可合并）。翻转调用里的坐标
+`(t', q')` 还原为原坐标 `(199−t', 99−q')`。
+
+为什么是反向**互补**而不是简单反转：DNA 是双链，反向读左翼等于换到互补链，需 A↔T、C↔G
+才能保持匹配语义（编码 0↔3、1↔2）。KSW2 与字母表无关，`revcomp` 由调用方提供；非 DNA
+字母表纯反转即可。CIGAR 只需反序、不用交换 I/D——两条序列同时 revcomp 后，query 多出的
+碱基仍是 I。
+
+一个跑通的例子（种子 `GGCC`，左翼一个错配，match +2 / mismatch −4）：
+
+```
+target: ACGTAC GGCC TTAGCA
+query:  ACGTTC GGCC TTAGCA
+```
+
+- 右调用：`6M`，score 12；左调用（revcomp 前缀 + `REV_CIGAR`）：`6M`，score 6
+- 拼接：`6M + 4M + 6M`，总分 `6 + 8 + 12 = 26 = 15×2 − 4`
+
+两个方向各自独立，各有自己的 `max`/`zdropped`/`score`。注意 `EXTZ_ONLY` 的语义：回溯从
+最优点 `(max_t, max_q)` 出发，即延伸只做到还有利可图的地方为止——左翼若出现把分数拉低的
+indel，CIGAR 会在最优点截断（与 Z-drop 一致的止损行为）；不加 `EXTZ_ONLY` 且两端都到达
+时，则会强制对齐整个前缀。`extz2_sse` 的 `end_bonus` 还能在 `mqe + end_bonus > max` 时把
+终点拉到 query 末端（`reach_end`）。
+
+## 5. 函数命名对照
 
 - **`extz` vs `extz2_sse`**：同一个算法的两条实现路径。`extz` 是标量、Green 经典 DP 形式；
   `extz2_sse` 用 Suzuki 差分形式 + SSE4.1 向量化，是 KSW2/minimap2 实际推荐使用的接口，两者
@@ -81,10 +138,9 @@ X-drop（`extf2_sse` 用的那种，纯分数差阈值）更精细的地方。
   分布；`exts` 再加剪接感知（超长 gap 封顶为内含子，输出 `N`）；`extf` 是线性 gap + X-drop 的
   仅打分快速路径。
 - **`Flags::EXTZ_ONLY`**：CIGAR 回溯从最优点 `(max_t, max_q)` 出发走回 (0,0)，而不是强行对齐
-  到两序列末端——即「只要延伸段」。配合 `REV_CIGAR` 就是 minimap2 的典型用法：先反向互补、
-  向左延伸、再把 CIGAR 反序拼回正向。
+  到两序列末端——即「只要延伸段」。配合 `REV_CIGAR` 可做双向延伸，见第 4 节。
 
-## 5. 小结
+## 6. 小结
 
 延伸比对 = **固定起点（锚点）+ 自由终点 + 仿射 gap + Z-drop 止损**的 NW 型动态规划，是把廉价
 的精确种子变成完整比对的关键一步。
