@@ -159,7 +159,7 @@ assert_eq!((s, cigar), (16, vec![8 << 4])); // "8M"
 ### 延伸比对（单段仿射）：`extz` / `extz2_sse`
 
 概念背景（种子-延伸策略、与全局/局部比对的区别、Z-drop 原理）见
-[doc/extension-alignment.md](doc/extension-alignment.md)。
+[docs/extension-alignment.md](docs/extension-alignment.md)。
 
 在全局比对参数基础上增加 `z_drop`、`flags`（`extz2_sse` 另有 `end_bonus`）：
 
