@@ -2,7 +2,7 @@
 
 use crate::common::backtrack;
 
-pub fn ksw_gg2(
+pub(crate) fn ksw_gg2(
     query_len: i32,
     query: &[u8],
     target_len: i32,

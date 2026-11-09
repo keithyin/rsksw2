@@ -4,10 +4,8 @@ use core::arch::x86_64::*;
 
 use crate::common::{apply_z_drop, backtrack, reset_extension_result};
 use crate::{
-    KSW_EZ_APPROX_DROP, KSW_EZ_APPROX_MAX, KSW_EZ_EXTZ_ONLY, KSW_EZ_GENERIC_SC,
-    KSW_EZ_REV_CIGAR, KSW_EZ_RIGHT,
-    KSW_EZ_SCORE_ONLY, KSW_EZ_SPLICE_FLANK, KSW_EZ_SPLICE_FOR, KSW_EZ_SPLICE_REV, KSW_NEG_INF,
-    KswExtz,
+    EZ_APPROX_DROP, EZ_APPROX_MAX, EZ_EXTZ_ONLY, EZ_GENERIC_SC, EZ_REV_CIGAR, EZ_RIGHT,
+    EZ_SCORE_ONLY, EZ_SPLICE_FLANK, EZ_SPLICE_FOR, EZ_SPLICE_REV, NEG_INF, ExtzResult,
 };
 
 // Backtrack byte layout (see `ksw2.h`): the low 3 bits hold the state that
@@ -36,7 +34,7 @@ pub(crate) unsafe fn ksw_exts2_sse(
     junction_bonus: i8,
     flags: i32,
     junctions: &[u8],
-    result: &mut KswExtz,
+    result: &mut ExtzResult,
 ) {
     unsafe {
         reset_extension_result(result);
@@ -102,8 +100,8 @@ pub(crate) unsafe fn ksw_exts2_sse(
         let long_gap_difference =
             long_gap_threshold * gap_extension_i32 - (gap_open2_i32 - gap_open_i32);
 
-        let record_cigar = (flags & KSW_EZ_SCORE_ONLY) == 0;
-        let approximate_max = (flags & KSW_EZ_APPROX_MAX) != 0;
+        let record_cigar = (flags & EZ_SCORE_ONLY) == 0;
+        let approximate_max = (flags & EZ_APPROX_MAX) != 0;
         let mut u = vec![zero_vector; target_block_count];
         let mut v = vec![zero_vector; target_block_count];
         let mut x = vec![zero_vector; target_block_count];
@@ -117,7 +115,7 @@ pub(crate) unsafe fn ksw_exts2_sse(
         let mut score_table: Vec<i32> = if approximate_max {
             Vec::new()
         } else {
-            vec![KSW_NEG_INF; target_block_count * 16 + 4]
+            vec![NEG_INF; target_block_count * 16 + 4]
         };
         let row_count = (query_len + target_len - 1) as usize;
         let mut backtrack_matrix: Vec<u8> = Vec::new();
@@ -159,10 +157,10 @@ pub(crate) unsafe fn ksw_exts2_sse(
         let reverse_query_ptr = reverse_query.as_ptr();
 
         // set the donor and acceptor arrays. TODO: this assumes 0/1/2/3 encoding!
-        if (flags & (KSW_EZ_SPLICE_FOR | KSW_EZ_SPLICE_REV)) != 0 {
-            let splice_forward = (flags & KSW_EZ_SPLICE_FOR) != 0;
-            let splice_reverse = (flags & KSW_EZ_SPLICE_REV) != 0;
-            let semi_canonical_cost: i32 = if (flags & KSW_EZ_SPLICE_FLANK) != 0 {
+        if (flags & (EZ_SPLICE_FOR | EZ_SPLICE_REV)) != 0 {
+            let splice_forward = (flags & EZ_SPLICE_FOR) != 0;
+            let splice_reverse = (flags & EZ_SPLICE_REV) != 0;
+            let semi_canonical_cost: i32 = if (flags & EZ_SPLICE_FLANK) != 0 {
                 -non_canonical_penalty_i32 / 2
             } else {
                 0
@@ -176,7 +174,7 @@ pub(crate) unsafe fn ksw_exts2_sse(
             }
             let donor_ptr = donor.as_mut_ptr() as *mut i8;
             let acceptor_ptr = acceptor.as_mut_ptr() as *mut i8;
-            if (flags & KSW_EZ_REV_CIGAR) == 0 {
+            if (flags & EZ_REV_CIGAR) == 0 {
                 for target_index in 0..(target_len as usize).saturating_sub(4) {
                     let mut canonical_type = 0i32; // 0=none, 1=GT/AG only, 2=GTr/yAG
                     if splice_forward && target[target_index + 1] == 2 && target[target_index + 2] == 3 {
@@ -348,7 +346,7 @@ pub(crate) unsafe fn ksw_exts2_sse(
             }
             // loop fission: set scores first
             let reverse_query_base = query_len_usize as isize - 1 - anti_diagonal as isize;
-            if (flags & KSW_EZ_GENERIC_SC) == 0 {
+            if (flags & EZ_GENERIC_SC) == 0 {
                 let mut target_index = unpadded_band_start;
                 while target_index <= unpadded_band_end {
                     let target_index_usize = target_index as usize;
@@ -454,7 +452,7 @@ pub(crate) unsafe fn ksw_exts2_sse(
                     );
                     block += 1;
                 }
-            } else if (flags & KSW_EZ_RIGHT) == 0 {
+            } else if (flags & EZ_RIGHT) == 0 {
                 // gap left-alignment
                 let backtrack_row_offset =
                     anti_diagonal as usize * backtrack_blocks * 16 - band_start as usize;
@@ -785,7 +783,7 @@ pub(crate) unsafe fn ksw_exts2_sse(
                 }
                 // note: unlike extz2, the C code calls ksw_apply_zdrop() outside
                 // the "if (anti_diagonal > 0)" block here
-                if (flags & KSW_EZ_APPROX_DROP) != 0
+                if (flags & EZ_APPROX_DROP) != 0
                     && apply_z_drop(
                         result,
                         true,
@@ -807,10 +805,10 @@ pub(crate) unsafe fn ksw_exts2_sse(
         }
 
         if record_cigar {
-            let reverse_cigar = (flags & KSW_EZ_REV_CIGAR) != 0;
+            let reverse_cigar = (flags & EZ_REV_CIGAR) != 0;
             let backtrack_bytes = &backtrack_matrix[..row_count * backtrack_blocks * 16];
             let backtrack_row_bytes = backtrack_blocks as i32 * 16;
-            if !result.zdropped && (flags & KSW_EZ_EXTZ_ONLY) == 0 {
+            if !result.zdropped && (flags & EZ_EXTZ_ONLY) == 0 {
                 backtrack(
                     true,
                     reverse_cigar,

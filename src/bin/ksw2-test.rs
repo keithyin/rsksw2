@@ -130,14 +130,14 @@ struct Options {
     gap_extension2: i8,
     band_width: i32,
     z_drop: i32,
-    flags: i32,
-    alphabet_size: i8,
-    score_matrix: [i8; 25],
+    flags: Flags,
+    alphabet_size: usize,
+    score_matrix: Vec<i8>,
 }
 
 fn run_alignment(
     algorithm: &str,
-    result: &mut KswExtz,
+    result: &mut ExtzResult,
     query_sequence: &str,
     target_sequence: &str,
     options: &Options,
@@ -148,115 +148,62 @@ fn run_alignment(
     result.mqe_t = -1;
     result.mte_q = -1;
     result.max = 0;
-    result.mqe = KSW_NEG_INF;
-    result.mte = KSW_NEG_INF;
+    result.mqe = NEG_INF;
+    result.mte = NEG_INF;
     result.cigar.clear();
 
     let encoded_query = encode_sequence(query_sequence);
     let encoded_target = encode_sequence(target_sequence);
-    let query_len = encoded_query.len() as i32;
-    let target_len = encoded_target.len() as i32;
-    let alphabet_size = options.alphabet_size;
-    let score_matrix = &options.score_matrix[..];
-    let gap_open = options.gap_open;
-    let gap_extension = options.gap_extension;
-    let gap_open2 = options.gap_open2;
-    let gap_extension2 = options.gap_extension2;
-    let band_width = options.band_width;
-    let z_drop = options.z_drop;
+    let scoring = Scoring::new(
+        options.alphabet_size,
+        &options.score_matrix,
+        options.gap_open,
+        options.gap_extension,
+    );
+    let band_width = if options.band_width < 0 {
+        None
+    } else {
+        Some(options.band_width)
+    };
+    let z_drop = if options.z_drop < 0 {
+        None
+    } else {
+        Some(options.z_drop)
+    };
     let flags = options.flags;
-    let score_only = flags & KSW_EZ_SCORE_ONLY != 0;
+    let score_only = flags.contains(Flags::SCORE_ONLY);
 
     match algorithm {
         "gg" => {
             let cigar = if score_only { None } else { Some(&mut result.cigar) };
-            result.score = ksw_gg(
-                query_len,
-                &encoded_query,
-                target_len,
-                &encoded_target,
-                alphabet_size,
-                score_matrix,
-                gap_open,
-                gap_extension,
-                band_width,
-                cigar,
-            );
+            result.score = gg(&encoded_query, &encoded_target, &scoring, band_width, cigar);
         }
         "gg2" => {
             let cigar = if score_only { None } else { Some(&mut result.cigar) };
-            result.score = ksw_gg2(
-                query_len,
-                &encoded_query,
-                target_len,
-                &encoded_target,
-                alphabet_size,
-                score_matrix,
-                gap_open,
-                gap_extension,
-                band_width,
-                cigar,
-            );
+            result.score = gg2(&encoded_query, &encoded_target, &scoring, band_width, cigar);
         }
         "gg2_sse" => {
-            result.score = ksw_gg2_sse(
-                query_len,
+            result.score = gg2_sse(
                 &encoded_query,
-                target_len,
                 &encoded_target,
-                alphabet_size,
-                score_matrix,
-                gap_open,
-                gap_extension,
+                &scoring,
                 band_width,
                 &mut result.cigar,
             );
         }
         "extz" => {
-            ksw_extz(
-                query_len,
-                &encoded_query,
-                target_len,
-                &encoded_target,
-                alphabet_size,
-                score_matrix,
-                gap_open,
-                gap_extension,
-                band_width,
-                z_drop,
-                flags,
-                result,
-            );
+            extz(&encoded_query, &encoded_target, &scoring, band_width, z_drop, flags, result);
         }
         "extz2_sse" => {
-            ksw_extz2_sse(
-                query_len,
-                &encoded_query,
-                target_len,
-                &encoded_target,
-                alphabet_size,
-                score_matrix,
-                gap_open,
-                gap_extension,
-                band_width,
-                z_drop,
-                0,
-                flags,
-                result,
-            );
+            extz2_sse(&encoded_query, &encoded_target, &scoring, band_width, z_drop, 0, flags, result);
         }
         "extd" => {
-            ksw_extd(
-                query_len,
+            extd(
                 &encoded_query,
-                target_len,
                 &encoded_target,
-                alphabet_size,
-                score_matrix,
-                gap_open,
-                gap_extension,
-                gap_open2,
-                gap_extension2,
+                &scoring,
+                options.gap_open2,
+                options.gap_extension2,
                 band_width,
                 z_drop,
                 flags,
@@ -264,17 +211,12 @@ fn run_alignment(
             );
         }
         "extd2_sse" => {
-            ksw_extd2_sse(
-                query_len,
+            extd2_sse(
                 &encoded_query,
-                target_len,
                 &encoded_target,
-                alphabet_size,
-                score_matrix,
-                gap_open,
-                gap_extension,
-                gap_open2,
-                gap_extension2,
+                &scoring,
+                options.gap_open2,
+                options.gap_extension2,
                 band_width,
                 z_drop,
                 0,
@@ -283,56 +225,48 @@ fn run_alignment(
             );
         }
         "extf2_sse" => {
-            ksw_extf2_sse(
-                query_len,
+            extf2_sse(
                 &encoded_query,
-                target_len,
                 &encoded_target,
-                score_matrix[0],
-                score_matrix[1],
-                gap_extension,
+                options.score_matrix[0],
+                options.score_matrix[1],
+                options.gap_extension,
                 band_width,
                 z_drop,
                 result,
             );
         }
         "exts2_sse" => {
-            let mut splice_score_matrix = [0i8; 25];
-            gen_simple_mat(5, &mut splice_score_matrix, 1, 2);
-            ksw_exts2_sse(
-                query_len,
+            let splice_score_matrix = gen_simple_mat(5, 1, 2);
+            let splice_scoring = Scoring::new(5, &splice_score_matrix, 2, 1);
+            exts2_sse(
                 &encoded_query,
-                target_len,
                 &encoded_target,
-                alphabet_size,
-                &splice_score_matrix,
-                2,
-                1,
+                &splice_scoring,
                 32,
                 4,
                 z_drop,
                 0,
-                flags | KSW_EZ_SPLICE_FOR,
+                flags | Flags::SPLICE_FOR,
                 &[],
                 result,
             );
         }
         "test" => {
-            ksw_extd2_sse(
-                query_len,
+            // cli.c hardcodes every alignment parameter here except the
+            // scoring matrix: ksw_extd2_sse(..., m, mat, 4, 2, 24, 1, 751, 400, 0, 8, ez)
+            let test_scoring =
+                Scoring::new(options.alphabet_size, &options.score_matrix, 4, 2);
+            extd2_sse(
                 &encoded_query,
-                target_len,
                 &encoded_target,
-                alphabet_size,
-                score_matrix,
-                4,
-                2,
+                &test_scoring,
                 24,
                 1,
-                751,
-                400,
+                Some(751),
+                Some(400),
                 0,
-                8,
+                Flags::APPROX_MAX,
                 result,
             );
         }
@@ -343,7 +277,12 @@ fn run_alignment(
     }
 }
 
-fn print_alignment(writer: &mut impl Write, target_name: &str, query_name: &str, result: &KswExtz) {
+fn print_alignment(
+    writer: &mut impl Write,
+    target_name: &str,
+    query_name: &str,
+    result: &ExtzResult,
+) {
     let _ = write!(
         writer,
         "{}\t{}\t{}\t{}\t{}\t{}",
@@ -425,7 +364,7 @@ fn main() {
     let mut gap_extension2: i8 = 1;
     let mut pairwise_mode = true;
     let mut band_width = -1i32;
-    let mut flags = 0i32;
+    let mut flags = Flags::empty();
     let mut repeat_count = 1i32;
     let mut z_drop = -1i32;
     let mut algorithm = String::from("extd");
@@ -466,9 +405,9 @@ fn main() {
                     gap_extension = first as i8;
                     gap_extension2 = second.unwrap_or(first) as i8;
                 }
-                'r' => flags |= KSW_EZ_RIGHT,
-                's' => flags |= KSW_EZ_SCORE_ONLY,
-                'g' => flags |= KSW_EZ_APPROX_MAX | KSW_EZ_APPROX_DROP,
+                'r' => flags |= Flags::RIGHT,
+                's' => flags |= Flags::SCORE_ONLY,
+                'g' => flags |= Flags::APPROX_MAX | Flags::APPROX_DROP,
                 'K' => {} // no_kalloc: the Rust port has no memory pool
                 'a' => pairwise_mode = false,
                 _ => {}
@@ -493,8 +432,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    let mut score_matrix = [0i8; 25];
-    gen_simple_mat(5, &mut score_matrix, match_score, -mismatch_penalty);
+    let score_matrix = gen_simple_mat(5, match_score, -mismatch_penalty);
     let options = Options {
         gap_open,
         gap_extension,
@@ -509,7 +447,7 @@ fn main() {
 
     let stdout = std::io::stdout();
     let mut writer = std::io::BufWriter::new(stdout.lock());
-    let mut result = KswExtz::new();
+    let mut result = ExtzResult::new();
 
     let target_file = read_records(&operands[0]);
     let query_file = read_records(&operands[1]);

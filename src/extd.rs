@@ -3,10 +3,10 @@
 
 use crate::common::{apply_z_drop, backtrack, reset_extension_result};
 use crate::{
-    KSW_EZ_EXTZ_ONLY, KSW_EZ_REV_CIGAR, KSW_EZ_RIGHT, KSW_EZ_SCORE_ONLY, KSW_NEG_INF, KswExtz,
+    EZ_EXTZ_ONLY, EZ_REV_CIGAR, EZ_RIGHT, EZ_SCORE_ONLY, NEG_INF, ExtzResult,
 };
 
-pub fn ksw_extd(
+pub(crate) fn ksw_extd(
     query_len: i32,
     query: &[u8],
     target_len: i32,
@@ -20,7 +20,7 @@ pub fn ksw_extd(
     band_width: i32,
     z_drop: i32,
     flags: i32,
-    result: &mut KswExtz,
+    result: &mut ExtzResult,
 ) {
     reset_extension_result(result);
     if alphabet_size <= 0 || query_len <= 0 || target_len <= 0 {
@@ -46,7 +46,7 @@ pub fn ksw_extd(
     } else {
         2 * band_width + 1
     };
-    let record_cigar = (flags & KSW_EZ_SCORE_ONLY) == 0;
+    let record_cigar = (flags & EZ_SCORE_ONLY) == 0;
     let query_len_usize = query_len as usize;
     let target_len_usize = target_len as usize;
     let backtrack_columns_usize = backtrack_columns as usize;
@@ -102,7 +102,7 @@ pub fn ksw_extd(
         query_index += 1;
     }
     while query_index <= query_len {
-        column_scores[query_index as usize] = [KSW_NEG_INF, KSW_NEG_INF, KSW_NEG_INF, 0];
+        column_scores[query_index as usize] = [NEG_INF, NEG_INF, NEG_INF, 0];
         query_index += 1;
     }
 
@@ -111,11 +111,11 @@ pub fn ksw_extd(
     let backtrack_matrix_ptr = backtrack_matrix.as_mut_ptr();
     let band_start_ptr = band_start_per_row.as_mut_ptr();
     let target_ptr = target.as_ptr();
-    let right_align = (flags & KSW_EZ_RIGHT) != 0;
+    let right_align = (flags & EZ_RIGHT) != 0;
     let mut max_score_query_index = 0i32;
 
     for target_index in 0..target_len {
-        let mut max_score = KSW_NEG_INF;
+        let mut max_score = NEG_INF;
         let band_start = if target_index > band_width {
             target_index - band_width
         } else {
@@ -134,17 +134,17 @@ pub fn ksw_extd(
             second_gap_h_base
         };
         let mut h_from_left = if band_start > 0 {
-            KSW_NEG_INF
+            NEG_INF
         } else {
             best_gap_h_base
         };
         let mut f_gap_score = if band_start > 0 {
-            KSW_NEG_INF
+            NEG_INF
         } else {
             best_gap_h_base - gap_open_plus_extension
         };
         let mut f2_gap_score = if band_start > 0 {
-            KSW_NEG_INF
+            NEG_INF
         } else {
             best_gap_h_base - gap_open2_plus_extension2
         };
@@ -285,7 +285,7 @@ pub fn ksw_extd(
             }
             let next_column = ((band_end + 1) as usize).min(query_len_usize);
             (*column_scores_ptr.add(next_column))[0] = h_from_left;
-            (*column_scores_ptr.add(next_column))[1] = KSW_NEG_INF;
+            (*column_scores_ptr.add(next_column))[1] = NEG_INF;
         }
         // update the result
         if band_end == query_len - 1 && column_scores[query_len_usize][0] > result.mqe {
@@ -313,8 +313,8 @@ pub fn ksw_extd(
     }
 
     if record_cigar {
-        let reverse_cigar = (flags & KSW_EZ_REV_CIGAR) != 0;
-        if !result.zdropped && (flags & KSW_EZ_EXTZ_ONLY) == 0 {
+        let reverse_cigar = (flags & EZ_REV_CIGAR) != 0;
+        if !result.zdropped && (flags & EZ_EXTZ_ONLY) == 0 {
             backtrack(
                 false,
                 reverse_cigar,

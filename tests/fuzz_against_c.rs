@@ -30,12 +30,10 @@ const F_LIST: [i32; 12] = [0x000, 0x001, 0x040, 0x002, 0x080, 0x082, 0x003, 0x00
 const FS_LIST: [i32; 9] = [0x100, 0x200, 0x104, 0x204, 0x500, 0x600, 0x101, 0x201, 0x000];
 
 struct Params {
-    qlen: usize,
-    tlen: usize,
     q: Vec<u8>,
     t: Vec<u8>,
     junc: Vec<u8>,
-    mat: [i8; 25],
+    mat: Vec<i8>,
     a: i8,
     b: i8,
     gq: i8,
@@ -52,6 +50,17 @@ struct Params {
     jb: i8,
 }
 
+/// The C API disables banding / Z-drop / X-drop with a negative sentinel;
+/// the Rust API uses `None`. The printed case description keeps the raw C
+/// value so that the output stays byte-identical to the oracle.
+fn optional(value: i32) -> Option<i32> {
+    if value < 0 {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 fn gen_case(id: u64) -> Params {
     let mut rng = Rng(id.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1));
     let qlen = 1 + (rng.next() % 60) as usize;
@@ -60,8 +69,7 @@ fn gen_case(id: u64) -> Params {
     let t: Vec<u8> = (0..tlen).map(|_| (rng.next() % 5) as u8).collect();
     let a = 1 + (rng.next() % 4) as i8;
     let b = -((1 + (rng.next() % 5)) as i8);
-    let mut mat = [0i8; 25];
-    gen_simple_mat(5, &mut mat, a, b);
+    let mat = gen_simple_mat(5, a, b);
     let gq = 2 + (rng.next() % 9) as i8;
     let ge = 1 + (rng.next() % 4) as i8;
     let gq2 = 10 + (rng.next() % 11) as i8;
@@ -85,7 +93,7 @@ fn gen_case(id: u64) -> Params {
     let jb = (rng.next() % 15) as i8;
     let junc: Vec<u8> = (0..tlen).map(|_| rng.next() as u8).collect();
     Params {
-        qlen, tlen, q, t, junc, mat, a, b, gq, ge, gq2, ge2,
+        q, t, junc, mat, a, b, gq, ge, gq2, ge2,
         w, zdrop, t_bonus, flag, sflag, xdrop, noncan, jb,
     }
 }
@@ -101,12 +109,12 @@ fn print_cigar(out: &mut String, c: &[u32]) {
     out.push(']');
 }
 
-fn print_ez(out: &mut String, name: &str, ez: &KswExtz) {
+fn print_ez(out: &mut String, name: &str, ez: &ExtzResult) {
     let _ = write!(
         out,
         "{} sc={} mqe={} mqe_t={} mte={} mte_q={} max={} max_t={} max_q={} z={} re={}",
         name, ez.score, ez.mqe, ez.mqe_t, ez.mte, ez.mte_q,
-        ez.max, ez.max_t, ez.max_q, ez.zdropped as i32, ez.reach_end
+        ez.max, ez.max_t, ez.max_q, ez.zdropped as i32, ez.reach_end as i32
     );
     print_cigar(out, &ez.cigar);
     out.push('\n');
@@ -135,69 +143,53 @@ fn matches_c_library_on_randomised_cases() {
             p.xdrop, p.noncan, p.jb
         );
 
+        let scoring = Scoring::new(5, &p.mat, p.gq, p.ge);
+        let band_width = optional(p.w);
+        let z_drop = optional(p.zdrop);
+        let x_drop = optional(p.xdrop);
+        let flags = Flags::from_bits(p.flag as u32);
+        let splice_flags = Flags::from_bits(p.sflag as u32);
+
         let mut ci = Vec::new();
-        let sc = ksw_gg(
-            p.qlen as i32, &p.q, p.tlen as i32, &p.t, 5, &p.mat, p.gq, p.ge, p.w, Some(&mut ci),
-        );
+        let sc = gg(&p.q, &p.t, &scoring, band_width, Some(&mut ci));
         let _ = write!(rebuilt, "gg {}", sc);
         print_cigar(&mut rebuilt, &ci);
         rebuilt.push('\n');
 
         let mut ci = Vec::new();
-        let sc = ksw_gg2(
-            p.qlen as i32, &p.q, p.tlen as i32, &p.t, 5, &p.mat, p.gq, p.ge, p.w, Some(&mut ci),
-        );
+        let sc = gg2(&p.q, &p.t, &scoring, band_width, Some(&mut ci));
         let _ = write!(rebuilt, "gg2 {}", sc);
         print_cigar(&mut rebuilt, &ci);
         rebuilt.push('\n');
 
         let mut ci = Vec::new();
-        let sc = ksw_gg2_sse(
-            p.qlen as i32, &p.q, p.tlen as i32, &p.t, 5, &p.mat, p.gq, p.ge, p.w, &mut ci,
-        );
+        let sc = gg2_sse(&p.q, &p.t, &scoring, band_width, &mut ci);
         let _ = write!(rebuilt, "gg2_sse {}", sc);
         print_cigar(&mut rebuilt, &ci);
         rebuilt.push('\n');
 
-        let mut ez = KswExtz::new();
-        ksw_extz(
-            p.qlen as i32, &p.q, p.tlen as i32, &p.t, 5, &p.mat, p.gq, p.ge,
-            p.w, p.zdrop, p.flag, &mut ez,
-        );
+        let mut ez = ExtzResult::new();
+        extz(&p.q, &p.t, &scoring, band_width, z_drop, flags, &mut ez);
         print_ez(&mut rebuilt, "extz", &ez);
 
-        let mut ez = KswExtz::new();
-        ksw_extz2_sse(
-            p.qlen as i32, &p.q, p.tlen as i32, &p.t, 5, &p.mat, p.gq, p.ge,
-            p.w, p.zdrop, p.t_bonus, p.flag, &mut ez,
-        );
+        let mut ez = ExtzResult::new();
+        extz2_sse(&p.q, &p.t, &scoring, band_width, z_drop, p.t_bonus, flags, &mut ez);
         print_ez(&mut rebuilt, "extz2_sse", &ez);
 
-        let mut ez = KswExtz::new();
-        ksw_extd(
-            p.qlen as i32, &p.q, p.tlen as i32, &p.t, 5, &p.mat, p.gq, p.ge, p.gq2, p.ge2,
-            p.w, p.zdrop, p.flag, &mut ez,
-        );
+        let mut ez = ExtzResult::new();
+        extd(&p.q, &p.t, &scoring, p.gq2, p.ge2, band_width, z_drop, flags, &mut ez);
         print_ez(&mut rebuilt, "extd", &ez);
 
-        let mut ez = KswExtz::new();
-        ksw_extd2_sse(
-            p.qlen as i32, &p.q, p.tlen as i32, &p.t, 5, &p.mat, p.gq, p.ge, p.gq2, p.ge2,
-            p.w, p.zdrop, p.t_bonus, p.flag, &mut ez,
-        );
+        let mut ez = ExtzResult::new();
+        extd2_sse(&p.q, &p.t, &scoring, p.gq2, p.ge2, band_width, z_drop, p.t_bonus, flags, &mut ez);
         print_ez(&mut rebuilt, "extd2_sse", &ez);
 
-        let mut ez = KswExtz::new();
-        ksw_extf2_sse(
-            p.qlen as i32, &p.q, p.tlen as i32, &p.t, p.a, p.b, p.ge, p.w, p.xdrop, &mut ez,
-        );
+        let mut ez = ExtzResult::new();
+        extf2_sse(&p.q, &p.t, p.a, p.b, p.ge, band_width, x_drop, &mut ez);
         print_ez(&mut rebuilt, "extf2_sse", &ez);
 
-        let mut ez = KswExtz::new();
-        ksw_exts2_sse(
-            p.qlen as i32, &p.q, p.tlen as i32, &p.t, 5, &p.mat, p.gq, p.ge, p.gq2,
-            p.noncan, p.zdrop, p.jb, p.sflag, &p.junc, &mut ez,
-        );
+        let mut ez = ExtzResult::new();
+        exts2_sse(&p.q, &p.t, &scoring, p.gq2, p.noncan, z_drop, p.jb, splice_flags, &p.junc, &mut ez);
         print_ez(&mut rebuilt, "exts2_sse", &ez);
     }
 

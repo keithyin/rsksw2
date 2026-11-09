@@ -1,8 +1,9 @@
 //! Port of `ksw2_gg.c`: global alignment, Green's standard formulation.
 
 use crate::common::backtrack;
+use crate::NEG_INF;
 
-pub fn ksw_gg(
+pub(crate) fn ksw_gg(
     query_len: i32,
     query: &[u8],
     target_len: i32,
@@ -15,7 +16,7 @@ pub fn ksw_gg(
     cigar: Option<&mut Vec<u32>>,
 ) -> i32 {
     if alphabet_size <= 0 || query_len <= 0 || target_len <= 0 {
-        return crate::KSW_NEG_INF;
+        return NEG_INF;
     }
     let alphabet_size_usize = alphabet_size as usize;
     let gap_extension_i32 = gap_extension as i32;
@@ -70,7 +71,7 @@ pub fn ksw_gg(
         query_index += 1;
     }
     while query_index <= query_len {
-        column_scores[query_index as usize] = [crate::KSW_NEG_INF, crate::KSW_NEG_INF];
+        column_scores[query_index as usize] = [NEG_INF, NEG_INF];
         query_index += 1;
     }
 
@@ -95,12 +96,12 @@ pub fn ksw_gg(
         // score of a gap of length `target_index`, i.e. -(gap_open + gap_extension*index)
         let leading_gap_score = -(gap_open_plus_extension + gap_extension_i32 * target_index);
         let mut h_from_left = if band_start > 0 {
-            crate::KSW_NEG_INF
+            NEG_INF
         } else {
             leading_gap_score
         };
         let mut f_gap_score = if band_start > 0 {
-            crate::KSW_NEG_INF
+            NEG_INF
         } else {
             leading_gap_score - gap_open_plus_extension
         };
@@ -159,7 +160,7 @@ pub fn ksw_gg(
             }
             let next_column = (band_end as usize).min(query_len_usize);
             (*column_scores_ptr.add(next_column))[0] = h_from_left;
-            (*column_scores_ptr.add(next_column))[1] = crate::KSW_NEG_INF;
+            (*column_scores_ptr.add(next_column))[1] = NEG_INF;
         }
     }
 

@@ -4,7 +4,7 @@
 use core::arch::x86_64::*;
 
 use crate::common::reset_extension_result;
-use crate::KswExtz;
+use crate::ExtzResult;
 
 #[target_feature(enable = "sse4.1")]
 pub(crate) unsafe fn ksw_extf2_sse(
@@ -17,7 +17,7 @@ pub(crate) unsafe fn ksw_extf2_sse(
     gap_extension: i8,
     band_width: i32,
     x_drop: i32,
-    result: &mut KswExtz,
+    result: &mut ExtzResult,
 ) {
     unsafe {
         reset_extension_result(result);

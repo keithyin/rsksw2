@@ -1,10 +1,7 @@
 //! Helpers shared by all implementations; direct ports of the `static inline`
 //! functions at the bottom of `ksw2.h`.
 
-use crate::{
-    KSW_CIGAR_DEL, KSW_CIGAR_EQ, KSW_CIGAR_INS, KSW_CIGAR_MATCH, KSW_CIGAR_N_SKIP, KSW_CIGAR_X,
-    KSW_NEG_INF, KswExtz,
-};
+use crate::{CigarOp, NEG_INF, ExtzResult};
 
 /// Port of `ksw_push_cigar()`. The C version manages `m_cigar`/`n_cigar`
 /// manually; `Vec` keeps the capacity across calls, which is equivalent.
@@ -20,18 +17,18 @@ pub(crate) fn push_cigar_operation(cigar: &mut Vec<u32>, operation: u32, length:
 
 /// Port of `ksw_reset_extz()`. The CIGAR becomes empty but its buffer is kept.
 #[inline]
-pub(crate) fn reset_extension_result(result: &mut KswExtz) {
+pub(crate) fn reset_extension_result(result: &mut ExtzResult) {
     result.max_q = -1;
     result.max_t = -1;
     result.mqe_t = -1;
     result.mte_q = -1;
     result.max = 0;
-    result.score = KSW_NEG_INF;
-    result.mqe = KSW_NEG_INF;
-    result.mte = KSW_NEG_INF;
+    result.score = NEG_INF;
+    result.mqe = NEG_INF;
+    result.mte = NEG_INF;
     result.cigar.clear();
     result.zdropped = false;
-    result.reach_end = 0;
+    result.reach_end = false;
 }
 
 /// Port of `ksw_apply_zdrop()`. Returns `true` when the extension should stop.
@@ -42,7 +39,7 @@ pub(crate) fn reset_extension_result(result: &mut KswExtz) {
 /// selects which convention is in use.
 #[inline]
 pub(crate) fn apply_z_drop(
-    result: &mut KswExtz,
+    result: &mut ExtzResult,
     is_rotated: bool,
     score: i32,
     first_index: i32,
@@ -149,32 +146,32 @@ pub(crate) fn backtrack(
             state = forced_state;
         }
         if state == 0 {
-            push_cigar_operation(cigar, KSW_CIGAR_MATCH, 1);
+            push_cigar_operation(cigar, CigarOp::Match.code(), 1);
             target_index -= 1;
             query_index -= 1;
         } else if state == 1 || (state == 3 && min_intron_length <= 0) {
-            push_cigar_operation(cigar, KSW_CIGAR_DEL, 1);
+            push_cigar_operation(cigar, CigarOp::Del.code(), 1);
             target_index -= 1;
         } else if state == 3 {
-            push_cigar_operation(cigar, KSW_CIGAR_N_SKIP, 1);
+            push_cigar_operation(cigar, CigarOp::NSkip.code(), 1);
             target_index -= 1;
         } else {
-            push_cigar_operation(cigar, KSW_CIGAR_INS, 1);
+            push_cigar_operation(cigar, CigarOp::Ins.code(), 1);
             query_index -= 1;
         }
     }
     if target_index >= 0 {
         // first deletion
         let operation = if min_intron_length > 0 && target_index >= min_intron_length {
-            KSW_CIGAR_N_SKIP
+            CigarOp::NSkip.code()
         } else {
-            KSW_CIGAR_DEL
+            CigarOp::Del.code()
         };
         push_cigar_operation(cigar, operation, target_index + 1);
     }
     if query_index >= 0 {
         // first insertion
-        push_cigar_operation(cigar, KSW_CIGAR_INS, query_index + 1);
+        push_cigar_operation(cigar, CigarOp::Ins.code(), query_index + 1);
     }
     if !is_reversed {
         cigar.reverse(); // reverse CIGAR
@@ -195,23 +192,23 @@ pub(crate) fn expand_cigar_matches(
     for &encoded in input_cigar {
         let operation = encoded & 0xf;
         let length = (encoded >> 4) as usize;
-        if operation == KSW_CIGAR_MATCH {
+        if operation == CigarOp::Match.code() {
             for offset in 0..length {
                 if target[target_position + offset] == query[query_position + offset] {
-                    push_cigar_operation(output_cigar, KSW_CIGAR_EQ, 1);
+                    push_cigar_operation(output_cigar, CigarOp::Eq.code(), 1);
                 } else {
-                    push_cigar_operation(output_cigar, KSW_CIGAR_X, 1);
+                    push_cigar_operation(output_cigar, CigarOp::X.code(), 1);
                 }
             }
             target_position += length;
             query_position += length;
         } else {
             push_cigar_operation(output_cigar, operation, length as i32);
-            if operation == KSW_CIGAR_DEL || operation == KSW_CIGAR_N_SKIP {
+            if operation == CigarOp::Del.code() || operation == CigarOp::NSkip.code() {
                 target_position += length;
-            } else if operation == KSW_CIGAR_INS {
+            } else if operation == CigarOp::Ins.code() {
                 query_position += length;
-            } else if operation == KSW_CIGAR_EQ || operation == KSW_CIGAR_X {
+            } else if operation == CigarOp::Eq.code() || operation == CigarOp::X.code() {
                 target_position += length;
                 query_position += length;
             }
