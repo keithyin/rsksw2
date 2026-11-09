@@ -26,12 +26,12 @@ oracle（`scripts/gen_expected.sh` 用 C 版本生成期望输出）。
 | `ksw2_gg.c` | `src/gg.rs` | `gg` | 全局比对，Green 经典形式 |
 | `ksw2_gg2.c` | `src/gg2.rs` | `gg2` | 全局比对，Suzuki 对角形式 |
 | `ksw2_gg2_sse.c` | `src/sse/gg2_sse.rs` | `gg2_sse` | 全局比对 + SSE4.1 |
-| `ksw2_extz.c` | `src/extz.rs` | `extz` | 扩展比对，单段仿射罚分 |
-| `ksw2_extz2_sse.c` | `src/sse/extz2_sse.rs` | `extz2_sse` | 扩展比对 + SSE4.1 |
-| `ksw2_extd.c` | `src/extd.rs` | `extd` | 扩展比对，双段仿射罚分 |
+| `ksw2_extz.c` | `src/extz.rs` | `extz` | 延伸比对，单段仿射罚分 |
+| `ksw2_extz2_sse.c` | `src/sse/extz2_sse.rs` | `extz2_sse` | 延伸比对 + SSE4.1 |
+| `ksw2_extd.c` | `src/extd.rs` | `extd` | 延伸比对，双段仿射罚分 |
 | `ksw2_extd2_sse.c` | `src/sse/extd2_sse.rs` | `extd2_sse` | 双段仿射 + SSE4.1 |
 | `ksw2_extf2_sse.c` | `src/sse/extf2_sse.rs` | `extf2_sse` | 线性罚分 + X-drop，仅打分 |
-| `ksw2_exts2_sse.c` | `src/sse/exts2_sse.rs` | `exts2_sse` | 剪接感知扩展 + SSE4.1 |
+| `ksw2_exts2_sse.c` | `src/sse/exts2_sse.rs` | `exts2_sse` | 剪接感知延伸 + SSE4.1 |
 | `cli.c` | `src/bin/ksw2-test.rs` | 可执行文件 `ksw2-test` | 与 C 版命令行完全兼容 |
 | `ksw2.h`（结构体/工具函数） | `src/lib.rs`, `src/common.rs` | `Scoring`, `ExtzResult`, `Flags`, `CigarOp` 等 | 打分系统、结果结构、标志位、回溯等 |
 
@@ -118,7 +118,7 @@ let scoring = Scoring::new(5, &mat, 4, 2);
 * **打分系统**：`Scoring` 打包符号种数 `alphabet_size`、`alphabet_size × alphabet_size`
   的行主序打分矩阵与 gap 罚分；`score_matrix[i·m+j]` 为 target 符号 `i` 对 query 符号
   `j` 的得分。`Scoring::new` 会校验矩阵形状与 `alphabet_size ∈ 1..=127`。注意：
-  **未设置 `Flags::GENERIC_SC` 时**，三个 SSE 扩展函数只用 `score_matrix[0]`（符号相同）
+  **未设置 `Flags::GENERIC_SC` 时**，三个 SSE 延伸函数只用 `score_matrix[0]`（符号相同）
   与 `score_matrix[1]`（符号不同）构造快速路径，并把符号 `alphabet_size−1` 视为
   wildcard——其得分为 `mat[m·m−1]==0 ? −e : mat[m·m−1]`（C 原版行为）。标量函数永远读
   完整矩阵，不受该标志影响。
@@ -130,9 +130,9 @@ let scoring = Scoring::new(5, &mat, 4, 2);
 * **`flags: Flags`**：用 `\|` 组合，如 `Flags::EXTZ_ONLY | Flags::REV_CIGAR`；
   `Flags::from_bits(u32)` 接受 C 风格的原始位值（未知位原样保留）。
 * **`*_sse` 函数**仅在 x86_64 上编译（与 C 的 `#ifdef __SSE2__` 一致），运行时缺 sse4.1 会 panic。
-* **前提检查**：SSE 扩展函数在矩阵最低分 `< −2(gap_open+gap_extension)` 时直接返回空结果
+* **前提检查**：SSE 延伸函数在矩阵最低分 `< −2(gap_open+gap_extension)` 时直接返回空结果
   （保证内部 i8 差分不饱和，C 同）；`exts2_sse` 还要求 `gap_open2 > gap_open+gap_extension`。
-* **结果复用**：扩展函数入口等价于 `ksw_reset_extz()`；`ExtzResult` 可 `new()` 一次后跨调用复用
+* **结果复用**：延伸函数入口等价于 `ksw_reset_extz()`；`ExtzResult` 可 `new()` 一次后跨调用复用
   （CIGAR 缓冲容量保留，等价 C 的 `m_cigar` 复用）。
 * **哨兵值**：`score == NEG_INF`（−0x40000000）表示未得到完整对齐分数。
 
@@ -156,7 +156,10 @@ let s = gg2_sse(&q, &t, &scoring, None, &mut cigar);
 assert_eq!((s, cigar), (16, vec![8 << 4])); // "8M"
 ```
 
-### 扩展比对（单段仿射）：`extz` / `extz2_sse`
+### 延伸比对（单段仿射）：`extz` / `extz2_sse`
+
+概念背景（种子-延伸策略、与全局/局部比对的区别、Z-drop 原理）见
+[doc/extension-alignment.md](doc/extension-alignment.md)。
 
 在全局比对参数基础上增加 `z_drop`、`flags`（`extz2_sse` 另有 `end_bonus`）：
 
@@ -199,7 +202,7 @@ assert!(ez.reach_end);                                  // mqe(6) + 5 > max(8)
 assert_eq!((ez.score, ez.max, ez.max_t, ez.max_q), (6, 8, 3, 3));
 ```
 
-### 扩展比对（两段仿射）：`extd` / `extd2_sse`
+### 延伸比对（两段仿射）：`extd` / `extd2_sse`
 
 gap 费用为两段仿射取小：`cost(l) = min{gap_open + l·gap_extension, gap_open2 + l·gap_extension2}`。
 第二段罚分（`gap_open2`/`gap_extension2`）作为独立参数传入。典型取法是
@@ -238,7 +241,7 @@ assert_eq!((ez.score, ez.zdropped), (0, false));        // 不设 X-drop：5×(+
 
 ### 剪接延伸：`exts2_sse`
 
-RNA 剪接感知的扩展：短 gap 按普通仿射罚分，超长 gap（内含子）的罚分**封顶**而非线性增长——
+RNA 剪接感知的延伸：短 gap 按普通仿射罚分，超长 gap（内含子）的罚分**封顶**而非线性增长——
 长度 `l ≤ long_thres ≈ (gap_open2−gap_open)/gap_extension − 1` 时按
 `gap_open + l·gap_extension` 计费，超过后总罚分不再随长度增长（实测
 `gap_open=2, gap_extension=3, gap_open2=10` 时 `l ≥ 3` 恒为 `gap_open2 = 10`）。
@@ -307,18 +310,18 @@ CIGAR 操作符用 `CigarOp` 枚举表示：`Match`(0)、`Ins`(1)、`Del`(2)、`
 
 ### 标志位 `Flags`
 
-下表中「扩展函数」指 `extz` / `extz2_sse` / `extd` / `extd2_sse` /
+下表中「延伸函数」指 `extz` / `extz2_sse` / `extd` / `extd2_sse` /
 `exts2_sse`（`extf2_sse` 没有 flags 参数）。
 
 | 标志 | 值 | 生效范围 | 语义 |
 |:--|:--|:--|:--|
-| `Flags::SCORE_ONLY` | 0x01 | 扩展函数 | 不回溯、不产 CIGAR |
-| `Flags::RIGHT` | 0x02 | 扩展函数 | gap 右对齐 |
-| `Flags::GENERIC_SC` | 0x04 | 3 个 SSE 扩展函数 | 按完整矩阵查分（见[通用约定](#通用约定)）；标量版无效 |
-| `Flags::APPROX_MAX` | 0x08 | SSE 扩展函数 | max 改用对角差分近似跟踪；此时只有再设 `APPROX_DROP` 才做 Z-drop |
-| `Flags::APPROX_DROP` | 0x10 | SSE 扩展函数 | 近似模式下的 Z-drop（与 `APPROX_MAX` 成对使用，即 CLI 的 `-g`） |
-| `Flags::EXTZ_ONLY` | 0x40 | 扩展函数 | 只延伸：CIGAR 回溯到最优/末端单元而非 (0,0) |
-| `Flags::REV_CIGAR` | 0x80 | 扩展函数 | CIGAR 反序输出（配合「先反向互补再延伸」的工作流） |
+| `Flags::SCORE_ONLY` | 0x01 | 延伸函数 | 不回溯、不产 CIGAR |
+| `Flags::RIGHT` | 0x02 | 延伸函数 | gap 右对齐 |
+| `Flags::GENERIC_SC` | 0x04 | 3 个 SSE 延伸函数 | 按完整矩阵查分（见[通用约定](#通用约定)）；标量版无效 |
+| `Flags::APPROX_MAX` | 0x08 | SSE 延伸函数 | max 改用对角差分近似跟踪；此时只有再设 `APPROX_DROP` 才做 Z-drop |
+| `Flags::APPROX_DROP` | 0x10 | SSE 延伸函数 | 近似模式下的 Z-drop（与 `APPROX_MAX` 成对使用，即 CLI 的 `-g`） |
+| `Flags::EXTZ_ONLY` | 0x40 | 延伸函数 | 只延伸：CIGAR 回溯到最优/末端单元而非 (0,0) |
+| `Flags::REV_CIGAR` | 0x80 | 延伸函数 | CIGAR 反序输出（配合「先反向互补再延伸」的工作流） |
 | `Flags::SPLICE_FOR` / `Flags::SPLICE_REV` | 0x100 / 0x200 | `exts2_sse` | 启用正链 / 负链剪接信号 |
 | `Flags::SPLICE_FLANK` | 0x400 | `exts2_sse` | 半经典位点罚 `−noncan/2` |
 | `Flags::EQX` | 0x800 | 仅 `extd2_sse` | M 拆为 `=`/`X` |
